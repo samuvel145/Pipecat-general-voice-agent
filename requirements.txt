@@ -1,0 +1,12 @@
+# Pipecat core + required service extras
+pipecat-ai[deepgram,groq,cartesia,silero,local]>=0.0.50
+
+# Config & env
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Audio I/O (local microphone + speaker)
+pyaudio>=0.2.14
+
+# Logging extras
+rich>=13.0.0          # colourful terminal log output
