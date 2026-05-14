@@ -16,14 +16,17 @@ log = get_logger("agent")
 
 
 def banner() -> None:
+    # Force UTF-8 on Windows to avoid cp1252 UnicodeEncodeError
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(
         "\n"
-        "╔══════════════════════════════════════════════╗\n"
-        "║   🎙  Pipecat AI Voice Agent  🎙             ║\n"
-        "║   STT : Deepgram nova-2                      ║\n"
-        "║   LLM : Groq llama-3.3-70b-versatile         ║\n"
-        "║   TTS : Cartesia sonic-2                     ║\n"
-        "╚══════════════════════════════════════════════╝\n"
+        "+----------------------------------------------+\n"
+        "|   [MIC]  Pipecat JLL Voice Agent  [MIC]      |\n"
+        "|   STT : Azure Speech (en-IN)                 |\n"
+        "|   LLM : Azure OpenAI gpt-4o-mini             |\n"
+        "|   TTS : Cartesia sonic-2                     |\n"
+        "+----------------------------------------------+\n"
     )
 
 

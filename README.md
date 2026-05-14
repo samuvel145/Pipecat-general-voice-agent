@@ -74,3 +74,9 @@ Speak into the microphone. Stop with **Ctrl+C**. Logs also go to `logs/agent.log
 
 - **Install hangs or PyAudio fails:** Use Python 3.11/3.12 for a new `venv`, or install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) if you must build PyAudio from source.
 - **Blank pip output:** Run `python -m pip install -r requirements.txt -v` to see progress.
+
+## New Commands
+```powershell
+npm install
+node proxy-server.js
+```
