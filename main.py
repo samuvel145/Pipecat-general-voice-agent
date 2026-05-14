@@ -9,6 +9,9 @@ Repository: https://github.com/samuvel145/Pipecat-general-voice-agent
 import asyncio
 import sys
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from logger import get_logger, setup_logging
 from pipeline.agent import run_agent
 
