@@ -10,3 +10,6 @@ pyaudio>=0.2.14
 
 # Logging extras
 rich>=13.0.0          # colourful terminal log output
+
+# HTTP client for JLL API calls
+httpx>=0.27.0
