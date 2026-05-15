@@ -7,11 +7,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # ── API Keys ──────────────────────────────────────────────
+    # ── Azure STT (Speech-to-Text) ────────────────────────────
+    AZURE_STT_KEY: str = ""
+    AZURE_SPEECH_REGION: str = "centralindia"
+
+    # ── Azure OpenAI LLM ──────────────────────────────────────
+    AZURE_OPENAI_API_KEY: str = ""
+    AZURE_OPENAI_ENDPOINT: str = ""
+    AZURE_OPENAI_DEPLOYMENT: str = "gpt-4o-mini"
+
+    # ── Previous STT/LLM (kept for fallback) ──────────────────
     DEEPGRAM_API_KEY: str = ""
     GROQ_API_KEY: str = ""
+
+    # ── TTS ────────────────────────────────────────────────────
     CARTESIA_API_KEY: str = ""
     CARTESIA_VOICE_ID: str = "default"
+    SARVAM_API_KEY: str = ""
+    SARVAM_VOICE_ID: str = "priya"
 
     # ── Audio ─────────────────────────────────────────────────
     SAMPLE_RATE: int = 16000
@@ -27,22 +40,26 @@ class Settings(BaseSettings):
 
     # ── VAD ───────────────────────────────────────────────────
     VAD_AGGRESSIVENESS: int = 2
-    SILENCE_THRESHOLD_MS: int = 800
+    # How long (ms) of silence before VAD considers speech ended
+    SILENCE_THRESHOLD_MS: int = 600
 
     # ── LLM ───────────────────────────────────────────────────
-    LLM_MODEL: str = "llama-3.3-70b-versatile"
-    LLM_MAX_TOKENS: int = 300
-    MAX_HISTORY_TURNS: int = 5
+    LLM_MODEL: str = "gpt-4o-mini"
+    LLM_MAX_TOKENS: int = 250
+    LLM_TEMPERATURE: float = 0.4
+    MAX_HISTORY_TURNS: int = 10
+
+    # ── JLL Integration ───────────────────────────────────────
+    JLL_PROXY_URL: str = "http://localhost:3000/api/integration"
+    JLL_ASSISTANT_NAME: str = "Riya"
 
     # ── Startup ───────────────────────────────────────────────
-    # Spoken once when the pipeline is ready (TTS). Set to empty string to disable.
-    STARTUP_GREETING: str = (
-        "Hi! I'm your voice assistant. Go ahead whenever you're ready — what would you like to talk about?"
-    )
+    STARTUP_GREETING: str = ""
 
     # ── Logging ────────────────────────────────────────────────
     LOG_LEVEL: str = "DEBUG"
     LOG_FILE: str = "logs/agent.log"
+
 
     model_config = SettingsConfigDict(env_file=".env")
 

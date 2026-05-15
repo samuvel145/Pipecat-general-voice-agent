@@ -16,6 +16,7 @@ lifecycle of each utterance:
 """
 
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -76,24 +77,52 @@ def setup_logging() -> None:
     Configure the root logger and all stage-specific child loggers.
     Call this once at application startup.
     """
-    level = getattr(logging, settings.LOG_LEVEL.upper(), logging.DEBUG)
-
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)   # Root captures everything; handlers filter
     root.handlers.clear()
 
-    # Terminal (rich coloured output)
-    root.addHandler(_make_rich_handler())
+    # Terminal — INFO+ only (our own clean events)
+    rich_handler = _make_rich_handler()
+    rich_handler.setLevel(logging.INFO)
+    root.addHandler(rich_handler)
 
-    # Rotating file
-    root.addHandler(_make_file_handler(settings.LOG_FILE))
+    # File — keep DEBUG for post-mortem analysis
+    file_handler = _make_file_handler(settings.LOG_FILE)
+    file_handler.setLevel(logging.DEBUG)
+    root.addHandler(file_handler)
 
-    # Silence noisy third-party loggers
-    for noisy in ("httpx", "httpcore", "websockets", "urllib3", "asyncio"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # ── Silence standard-library third-party loggers ─────────────────────
+    _SILENT = [
+        "httpx", "httpcore", "urllib3",
+        "openai", "openai._base_client", "openai.resources",
+        "websockets", "websockets.client", "websockets.server",
+        "pipecat",
+        "pipecat.pipeline", "pipecat.pipeline.task", "pipecat.pipeline.runner",
+        "pipecat.processors", "pipecat.services", "pipecat.transports",
+        "pipecat.audio", "pipecat.utils",
+        "asyncio", "loguru",
+    ]
+    for name in _SILENT:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # ── Silence loguru (Pipecat's internal logger) ───────────────────────
+    # Pipecat uses loguru (not logging), so setLevel above has no effect.
+    # We remove all loguru sinks and add one WARNING-only sink.
+    try:
+        from loguru import logger as _loguru
+        _loguru.remove()   # remove the default stderr sink (which dumps everything)
+        _loguru.add(
+            sys.stderr,
+            level="WARNING",
+            format="<yellow>{level}</>: {message}",
+            colorize=True,
+        )
+    except ImportError:
+        pass
 
     root.info("[bold green]Logging initialised[/bold green] — "
               f"level={settings.LOG_LEVEL}  file={settings.LOG_FILE}")
+
 
 
 def get_logger(stage: str) -> logging.Logger:

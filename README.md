@@ -1,24 +1,39 @@
-# Pipecat general voice agent
+# JLL Voice Sales Agent
 
-Local voice pipeline: microphone → Deepgram STT → Groq LLM → Cartesia TTS → speaker.
+Local voice pipeline: Microphone → Azure Speech STT → Azure OpenAI LLM → Cartesia TTS → Speaker.
 
-**Repository:** [github.com/samuvel145/Pipecat-general-voice-agent](https://github.com/samuvel145/Pipecat-general-voice-agent)
+**Repository:** [github.com/samuvel145/cubikey-jll](https://github.com/samuvel145/cubikey-jll)
 
-```powershell
-git clone https://github.com/samuvel145/Pipecat-general-voice-agent.git
-cd Pipecat-general-voice-agent
-copy .env.example .env
-# Edit .env with your API keys, then follow Setup below.
-```
+---
+
+## How it works
+
+Two processes must run together:
+
+| Process | File | What it does |
+|---------|------|-------------|
+| **Node proxy** | `proxy-server.js` | Express server on port 3000. Receives tool calls from the Python agent, forwards them to the JLL backend API. Loads `integration (1).js` automatically — **do not run that file directly**. |
+| **Python agent** | `main.py` | Pipecat voice pipeline. Mic → Azure STT → Azure OpenAI → Cartesia TTS → Speaker. |
+
+---
 
 ## Prerequisites
 
-- **Python 3.11 or 3.12** on Windows (PyAudio has prebuilt wheels; **avoid 3.14** for this project—slow or broken installs and a mismatched default `python` if your shell still points at 3.14).
-- API keys: [Deepgram](https://deepgram.com/), [Groq](https://console.groq.com/), [Cartesia](https://cartesia.ai/).
+- **Node.js** v18+ — for the proxy server
+- **Python 3.11 or 3.12** — PyAudio has prebuilt wheels for these versions. Avoid Python 3.14 (no prebuilt PyAudio wheel, requires manual build with vcpkg).
+- API keys: Azure Speech, Azure OpenAI, Cartesia, JLL backend
 
-## Setup (virtual environment)
+---
 
-From the project root, create the venv with **3.11** if the `py` launcher has it:
+## Setup
+
+### 1. Node.js dependencies
+
+```powershell
+npm install
+```
+
+### 2. Python virtual environment
 
 ```powershell
 py -3.11 -m venv venv
@@ -27,50 +42,78 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 ```
 
-If you only have one Python installed:
+### 3. Environment variables
 
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-```
-
-If you prefer not to activate the venv, use the venv’s Python explicitly:
-
-```powershell
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-## Configuration
-
-Copy `.env.example` to `.env` and add your keys. Required variables (see `config.py` for defaults and optional fields):
+Copy `.env.example` to `.env` and fill in your keys:
 
 | Variable | Purpose |
 |----------|---------|
-| `DEEPGRAM_API_KEY` | Speech-to-text |
-| `GROQ_API_KEY` | LLM |
-| `CARTESIA_API_KEY` | Text-to-speech |
-| `CARTESIA_VOICE_ID` | Cartesia voice id (not `default` unless that is your real id) |
-| `STARTUP_GREETING` | Optional. Spoken once at startup (TTS). Set to empty to disable. |
+| `AZURE_STT_KEY` | Azure Speech Services API key |
+| `AZURE_SPEECH_REGION` | Azure region, e.g. `centralindia` |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_DEPLOYMENT` | Deployment name, e.g. `gpt-4o-mini` |
+| `CARTESIA_API_KEY` | Cartesia TTS API key |
+| `CARTESIA_VOICE_ID` | Cartesia voice ID |
+| `JLL_PROXY_URL` | `http://localhost:3000/api/integration` (default) |
+| `JLL_BASE_URL` | JLL backend base URL |
 
-## Run the agent
+---
 
-After `pip install` finishes successfully:
+## Running the agent
+
+Open **two terminals** and run these in order:
+
+### Terminal 1 — Start the Node proxy first
 
 ```powershell
-.\venv\Scripts\python.exe main.py
+node proxy-server.js
 ```
 
-With an activated venv:
+You should see:
+```
+✅ JLL Integration Proxy listening on http://localhost:3000
+   Routes mounted at: /api/integration/proxy/*
+```
+
+> **Note:** `integration (1).js` is the router module — it is loaded automatically by `proxy-server.js`.
+> You never run it directly. Only `node proxy-server.js` is needed.
+
+### Terminal 2 — Start the Python agent
 
 ```powershell
+.\venv\Scripts\Activate.ps1
 python main.py
 ```
 
-Speak into the microphone. Stop with **Ctrl+C**. Logs also go to `logs/agent.log` (see `LOG_FILE` in `config.py`).
+Wait for the greeting, then speak. Press **Ctrl+C** to stop.
+
+---
+
+## File structure
+
+```
+proxy-server.js        ← Node entry point (run this)
+integration (1).js     ← JLL API router (loaded by proxy-server.js, do NOT run directly)
+pipeline/
+  agent.py             ← Pipecat pipeline wiring
+  tools.py             ← LLM tool schemas and handlers
+  jll_client.py        ← HTTP client calling the Node proxy
+  processors.py        ← Frame processors (STT log, TTS normalizer, function filter)
+  prompts.py           ← System prompt builder
+main.py                ← Entry point for the Python agent
+config.py              ← Settings from .env
+logger.py              ← Structured logging
+```
+
+---
 
 ## Troubleshooting
 
-- **Install hangs or PyAudio fails:** Use Python 3.11/3.12 for a new `venv`, or install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) if you must build PyAudio from source.
-- **Blank pip output:** Run `python -m pip install -r requirements.txt -v` to see progress.
+| Error | Fix |
+|-------|-----|
+| `SyntaxError: Invalid or unexpected token` in integration (1).js | Smart quotes crept in during editing. Run: `node -e "const fs=require('fs');let c=fs.readFileSync('integration (1).js','utf8');c=c.replace(/‘/g,\"'\").replace(/’/g,\"'\");fs.writeFileSync('integration (1).js',c,'utf8');console.log('fixed')"` |
+| `No module named 'pyaudio'` | Use Python 3.11/3.12. Or build from source with vcpkg (see below). |
+| `DLL load failed while importing _portaudio` | Copy `portaudio.dll` from vcpkg into `venv\Lib\site-packages\pyaudio\`. |
+| Agent returns "No properties found" | Ensure the Node proxy is running and was restarted after any edits to `integration (1).js`. |
+| `UnicodeEncodeError` on startup | Windows terminal encoding issue — already fixed in `main.py`. |
