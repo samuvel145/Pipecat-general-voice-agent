@@ -882,8 +882,7 @@ async function handleSearch(req, res) {
         limit: '20',
       });
       if (resolvedType) firstQs.set('property_type', resolvedType);
-      if (max_price) firstQs.set('max_price', String(max_price));
-      if (min_price) firstQs.set('min_price', String(min_price));
+      if (max_price) firstQs.set('All_Price', String(max_price));
 
       const firstRes = await fetch(`${JLL_BASE}/api/user/search/projects?${firstQs}`, { timeout: 8000 });
       const firstJson = await firstRes.json();
@@ -925,8 +924,7 @@ async function handleSearch(req, res) {
               limit: '20',
             });
             if (resolvedType) qs.set('property_type', resolvedType);
-            if (max_price) qs.set('max_price', String(max_price));
-            if (min_price) qs.set('min_price', String(min_price));
+            if (max_price) qs.set('All_Price', String(max_price));
 
             return fetch(`${JLL_BASE}/api/user/search/projects?${qs}`, { timeout: 8000 })
               .then(r => r.json())
@@ -991,8 +989,7 @@ async function handleSearch(req, res) {
   async function fetchJllPage(pg, locationOverride = undefined) {
     const qs = new URLSearchParams({ city: resolvedCity || '', page: String(pg), limit: '20' });
     if (resolvedType)     qs.set('property_type', resolvedType);
-    if (max_price)        qs.set('max_price', String(max_price));
-    if (min_price)        qs.set('min_price', String(min_price));
+    if (max_price)        qs.set('All_Price', String(max_price));
     if (locationOverride) qs.set('location', locationOverride);
     const jllRes = await fetch(`${JLL_BASE}/api/user/search/projects?${qs}`, { timeout: 10000 });
     const json   = await jllRes.json();
@@ -1517,8 +1514,7 @@ async function handleSearch(req, res) {
             limit: '20',
           });
           if (resolvedType) firstQs.set('property_type', resolvedType);
-          if (max_price) firstQs.set('max_price', String(max_price));
-          if (min_price) firstQs.set('min_price', String(min_price));
+          if (max_price) firstQs.set('All_Price', String(max_price));
 
           const firstRes = await fetch(`${JLL_BASE}/api/user/search/projects?${firstQs}`, { timeout: 8000 });
           const firstJson = await firstRes.json();
@@ -1560,8 +1556,7 @@ async function handleSearch(req, res) {
                   limit: '20',
                 });
                 if (resolvedType) qs.set('property_type', resolvedType);
-                if (max_price) qs.set('max_price', String(max_price));
-                if (min_price) qs.set('min_price', String(min_price));
+                if (max_price) qs.set('All_Price', String(max_price));
 
                 return fetch(`${JLL_BASE}/api/user/search/projects?${qs}`, { timeout: 8000 })
                   .then(r => r.json())
@@ -2417,8 +2412,7 @@ async function handleAreasByBudget(req, res) {
     const _buildQs = (pg) => {
       const qs = new URLSearchParams({ city: resolvedCity || '', page: String(pg), limit: '20' });
       if (resolvedType) qs.set('property_type', resolvedType);
-      if (maxPrice)     qs.set('max_price', String(maxPrice));
-      if (minPrice)     qs.set('min_price', String(minPrice));
+      if (maxPrice)     qs.set('All_Price', String(maxPrice));
       return qs;
     };
 
