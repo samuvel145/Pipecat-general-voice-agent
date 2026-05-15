@@ -59,6 +59,7 @@ def build_gather_hint(gathered: dict) -> str:
     location = gathered.get("location", "")
     min_price = gathered.get("min_price")
     max_price = gathered.get("max_price")
+    bedrooms = gathered.get("bedrooms", "")
 
     parts = []
     if city:
@@ -71,6 +72,8 @@ def build_gather_hint(gathered: dict) -> str:
         lo = f"{int(min_price):,}" if min_price else "0"
         hi = f"{int(max_price):,}" if max_price else "∞"
         parts.append(f"budget=₹{lo}–₹{hi}")
+    if bedrooms:
+        parts.append(f"bedrooms={bedrooms}")
 
     gathered_summary = ", ".join(parts) if parts else "nothing yet"
 

@@ -4,7 +4,9 @@
   "description": "Local voice pipeline: microphone → Deepgram STT → Groq LLM → Cartesia TTS → speaker.",
   "main": "integration (1).js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node proxy-server.js",
+    "sync-catalog": "node sync-catalog.js"
   },
   "repository": {
     "type": "git",

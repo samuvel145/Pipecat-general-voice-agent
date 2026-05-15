@@ -33,14 +33,14 @@ const JLL_BASE = process.env.JLL_API_URL || 'https://jll-backend.ibism.com';
 // TTL: 3 minutes â€” fresh enough for a call, short enough to avoid stale data.
 // This avoids repeat JLL API round-trips for the same search params within a
 // single call session (e.g. user says "show more" twice for the same criteria).
-const _searchCache   = new Map();  // key â†’ { data, ts }
+const _searchCache   = new Map();  // key â†' { data, ts }
 const CACHE_TTL_MS   = 180_000;   // 3 minutes
 
 // â”€â”€â”€ In-memory areas-by-budget cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // areas_by_budget scans up to 15 JLL pages sequentially â€” very expensive.
 // Cache the full area list for a given city+type+budget for 5 minutes so
 // repeated calls (same call, different pages, or back-to-back calls) are instant.
-const _areasCache       = new Map();  // key â†’ { areas, ts }
+const _areasCache       = new Map();  // key â†' { areas, ts }
 const AREAS_CACHE_TTL   = 300_000;   // 5 minutes
 const _propertyResolveCache = new Map(); // key -> { data, ts }
 const PROPERTY_RESOLVE_TTL_MS = 300_000;
@@ -169,21 +169,21 @@ const LOCATION_ALIASES = {
 
 /**
  * Normalize a location string for fuzzy matching:
- * strips dots, hyphens, extra whitespace â†’ "T. Nagar" â†’ "t nagar"
+ * strips dots, hyphens, extra whitespace â†' "T. Nagar" â†' "t nagar"
  * This is applied to BOTH the search token AND the JLL field values before
  * comparing, so "T. Nagar" (JLL stored format) matches spoken "T Nagar".
  */
 function normalizeStr(s) {
   return (s || '').toLowerCase()
-    .replace(/\./g, ' ')       // T. Nagar  â†’ T  Nagar
-    .replace(/-/g, ' ')        // Hi-Tech    â†’ Hi Tech
-    .replace(/\s+/g, ' ')      // T  Nagar   â†’ T Nagar
+    .replace(/\./g, ' ')       // T. Nagar  â†' T  Nagar
+    .replace(/-/g, ' ')        // Hi-Tech    â†' Hi Tech
+    .replace(/\s+/g, ' ')      // T  Nagar   â†' T Nagar
     .trim();
 }
 
 /**
  * Format an INR price value into a human-readable string.
- * e.g. 4500000 â†’ "45 L",  12500000 â†’ "1.3 Cr"
+ * e.g. 4500000 â†' "45 L",  12500000 â†' "1.3 Cr"
  * Returns null if val is falsy or 0.
  */
 function normalizeProjectPriceINR(val) {
@@ -552,9 +552,9 @@ async function _getPropertyIndex(city) {
 
 /**
  * Expand a location string into an array of normalized tokens to match against JLL data.
- * "OMR" â†’ ['omr', 'old mahabalipuram', 'sholinganallur', ...]
- * "T Nagar" â†’ ['t nagar', 't nagar', 'tnagar', 'teynampet']  (dot variants normalized)
- * "Velachery" â†’ ['velachery']  (no alias, returned as-is)
+ * "OMR" â†' ['omr', 'old mahabalipuram', 'sholinganallur', ...]
+ * "T Nagar" â†' ['t nagar', 't nagar', 'tnagar', 'teynampet']  (dot variants normalized)
+ * "Velachery" â†' ['velachery']  (no alias, returned as-is)
  *
  * All returned tokens are already normalized (no dots/hyphens) so they can be
  * compared directly against normalizeStr(haystack).
@@ -566,16 +566,16 @@ function expandLocationTokens(location) {
   // Also try the original lower-trimmed key (alias keys may have dots)
   const rawKey = location.toLowerCase().trim();
   if (LOCATION_ALIASES[rawKey]) return LOCATION_ALIASES[rawKey].map(normalizeStr);
-  // Partial alias hit (e.g. "OMR Road" â†’ key contains "omr")
+  // Partial alias hit (e.g. "OMR Road" â†' key contains "omr")
   for (const [alias, expansions] of Object.entries(LOCATION_ALIASES)) {
     const normAlias = normalizeStr(alias);
     if (key.includes(normAlias) || normAlias.includes(key)) return expansions.map(normalizeStr);
   }
   // No alias â€” keep multi-word phrase as ONE token. Do NOT split on spaces.
-  // Splitting "Gandhi Nagar" â†’ ["ghandi","nagar"] causes "nagar" to match
+  // Splitting "Gandhi Nagar" â†' ["ghandi","nagar"] causes "nagar" to match
   // Anna Nagar, T. Nagar, and dozens of other unrelated locations.
   // Only split on explicit separators (comma, slash) for multi-area requests
-  // like "OMR, ECR" â†’ ["omr", "ecr"].
+  // like "OMR, ECR" â†' ["omr", "ecr"].
   const parts = key.split(/[,\/]+/).map(s => s.trim()).filter(t => t.length >= 3);
   return parts.length > 0 ? parts : [key].filter(t => t.length >= 3);
 }
@@ -618,11 +618,11 @@ function reloadCatalog() {
  * Resolve a user-spoken value to its canonical JLL stored name.
  *
  * Strategy (in order):
- *   1. Exact normalized match:    "t nagar" === normalizeStr("T. Nagar") â†’ "T. Nagar"
- *   2. Starts-with match:         "omr" matches "OMR" â†’ first hit
+ *   1. Exact normalized match:    "t nagar" === normalizeStr("T. Nagar") â†' "T. Nagar"
+ *   2. Starts-with match:         "omr" matches "OMR" â†' first hit
  *   3. Contains match:            "nagar" substring in candidate
  *   4. Candidate contains input:  "anna nagar" contains "nagar" â€” return most specific hit
- *   5. No match â†’ return null (caller uses the original input or alias expansion)
+ *   5. No match â†' return null (caller uses the original input or alias expansion)
  *
  * @param {string} input  â€” user spoken value, e.g. "T Nagar", "apartments", "chennai"
  * @param {string} field  â€” "location" | "micro_market" | "city" | "property_type"
@@ -665,7 +665,7 @@ function resolveCatalogName(input, field, city = null) {
   const exact = candidates.find(c => normalizeStr(c) === norm);
   if (exact) return exact;
 
-  // 2. Starts-with match (e.g. "anna nagar" â†’ "Anna Nagar West" if that's the only one)
+  // 2. Starts-with match (e.g. "anna nagar" â†' "Anna Nagar West" if that's the only one)
   //    But prefer shorter/exact over longer
   const starts = candidates.filter(c => normalizeStr(c).startsWith(norm));
   if (starts.length === 1) return starts[0];
@@ -676,7 +676,7 @@ function resolveCatalogName(input, field, city = null) {
   }
 
   // 3. Input contains candidate (user said more than the stored name â€” trim suffix)
-  //    e.g. user says "T Nagar area" â†’ norm contains "t nagar"
+  //    e.g. user says "T Nagar area" â†' norm contains "t nagar"
   const inputContains = candidates.filter(c => norm.includes(normalizeStr(c)));
   if (inputContains.length > 0) {
     // Return the longest match (most specific)
@@ -684,8 +684,8 @@ function resolveCatalogName(input, field, city = null) {
   }
 
   // 4. Candidate contains input (user said part of the stored name)
-  //    e.g. user says "velachery" â†’ stored "Velachery" â†’ exact match above catches this
-  //    but covers partial: user says "sholingan" â†’ stored "Sholinganallur"
+  //    e.g. user says "velachery" â†' stored "Velachery" â†' exact match above catches this
+  //    but covers partial: user says "sholingan" â†' stored "Sholinganallur"
   const candContains = candidates.filter(c => normalizeStr(c).includes(norm));
   if (candContains.length === 1) return candContains[0];
   // Multiple partial hits â€” return only if norm is long enough to be unambiguous
@@ -764,13 +764,13 @@ async function handleSearch(req, res) {
 
   // â”€â”€ Catalog resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Map user-spoken values to exact JLL stored names before API calls.
-  // e.g. "T Nagar" â†’ "T. Nagar", "apartments" â†’ "Apartments", "bengalore" â†’ "Bengaluru"
+  // e.g. "T Nagar" â†' "T. Nagar", "apartments" â†' "Apartments", "bengalore" â†' "Bengaluru"
   // If catalog is empty (not yet synced), values pass through unchanged.
 
   // 1. City â€” resolve first since location/micro_market resolution is city-scoped
   const resolvedCity = resolveCatalogName(city, 'city') || city || '';
   if (resolvedCity !== city) {
-    console.log(`[Catalog] city: "${city}" â†’ "${resolvedCity}"`);
+    console.log(`[Catalog] city: "${city}" â†' "${resolvedCity}"`);
   }
 
   // 2. Location â€” resolve against catalog for the resolved city
@@ -781,7 +781,7 @@ async function handleSearch(req, res) {
     if (catalogLoc) {
       resolvedLocation = catalogLoc;
       if (catalogLoc !== location) {
-        console.log(`[Catalog] location: "${location}" â†’ "${resolvedLocation}"`);
+        console.log(`[Catalog] location: "${location}" â†' "${resolvedLocation}"`);
       }
     }
     const catalogMicroMarket = resolveCatalogName(location, 'micro_market', resolvedCity);
@@ -802,13 +802,29 @@ async function handleSearch(req, res) {
     if (catalogType) {
       resolvedType = catalogType;
       if (catalogType !== property_type) {
-        console.log(`[Catalog] property_type: "${property_type}" â†’ "${resolvedType}"`);
+        console.log(`[Catalog] property_type: "${property_type}" â†' "${resolvedType}"`);
+      }
+    } else {
+      // No catalog match - map to exact JLL API values (plural forms)
+      const _TYPE_MAP = {
+        'apartment': 'Apartments', 'apartments': 'Apartments',
+        'flat': 'Apartments', 'flats': 'Apartments',
+        'villa': 'Villas', 'villas': 'Villas',
+        'independent house': 'Villas', 'bungalow': 'Villas', 'row house': 'Villas',
+        'plot': 'Plot', 'plots': 'Plot', 'land': 'Plot', 'site': 'Plot',
+      };
+      const _mapped = _TYPE_MAP[property_type.toLowerCase()];
+      if (_mapped) {
+        resolvedType = _mapped;
+        console.log(`[Catalog] property_type: "${property_type}" â†' "${resolvedType}" (type-map fallback)`);
+      } else {
+        resolvedType = property_type.charAt(0).toUpperCase() + property_type.slice(1).toLowerCase();
       }
     }
   }
 
   console.log(
-    `[Integration] search_properties â†’ city=${resolvedCity} page=${pageNum} ` +
+    `[Integration] search_properties â†' city=${resolvedCity} page=${pageNum} ` +
     `location=${resolvedLocation || '-'} type=${resolvedType || '-'} ` +
     `category=${project_category || '-'} ` +
     `construction=${construction_state || '-'} ` +
@@ -852,7 +868,7 @@ async function handleSearch(req, res) {
         const verifyJson = await verifyRes.json();
         const verifyItems = Array.isArray(verifyJson?.data) ? verifyJson.data : [];
         propertyTypeExistsInArea = verifyItems.length > 0;
-        console.log(`[Integration] budget_too_low check: ${resolvedType} in '${resolvedLocation}' â†’ exists=${propertyTypeExistsInArea}, count=${verifyItems.length}`);
+        console.log(`[Integration] budget_too_low check: ${resolvedType} in '${resolvedLocation}' â†' exists=${propertyTypeExistsInArea}, count=${verifyItems.length}`);
       } catch (verifyErr) {
         // If verification fails, proceed with caution (assume exists)
         console.warn(`[Integration] Property type verification failed: ${verifyErr.message}`);
@@ -1047,10 +1063,10 @@ async function handleSearch(req, res) {
   // JLL field values use dotted abbreviations: "T. Nagar", "Hi-Tech City".
   // Spoken input is plain: "T Nagar", "Hitech City".
   // normalizeStr() strips dots/hyphens from BOTH sides before comparing, so
-  // "t. nagar" and "t nagar" both normalize to "t nagar" â†’ match succeeds.
+  // "t. nagar" and "t nagar" both normalize to "t nagar" â†' match succeeds.
   //
   // Accumulation strategy (latency-optimised):
-  //   1. Fast path: if page 1 already has â‰¥ PAGE_SIZE matches â†’ done immediately.
+  //   1. Fast path: if page 1 already has â‰¥ PAGE_SIZE matches â†' done immediately.
   //   2. Parallel burst: when page 1 has < PAGE_SIZE matches, fetch the next
   //      MAX_ACCUMULATE_PAGES pages IN PARALLEL using Promise.all instead of
   //      sequential awaits. This reduces worst-case from 15 Ã— 200ms = 3s to
@@ -1236,7 +1252,7 @@ async function handleSearch(req, res) {
           next.items.forEach(p => { if (p.Project_Slug) seenSlugs.add(p.Project_Slug); });
           const newMatches = filterBatch(newItems);
           matched = [...matched, ...newMatches];
-          console.log(`[Integration] page ${ep} (parallel): +${newMatches.length} â†’ total ${matched.length}`);
+          console.log(`[Integration] page ${ep} (parallel): +${newMatches.length} â†' total ${matched.length}`);
         }
         return anyNonEmpty;
       }
@@ -1261,7 +1277,7 @@ async function handleSearch(req, res) {
       //   A) Budget too low: area EXISTS in catalog but user's budget can't afford it
       //      (T. Nagar, Anna Nagar etc. appear on pages 10â€“20+ when sorted cheapest-first,
       //       so a single-page scan always misses them â€” use catalog check instead)
-      //   B) Area doesn't exist: location is not in catalog â†’ genuine no_location_match
+      //   B) Area doesn't exist: location is not in catalog â†' genuine no_location_match
       let budgetTooLow = false;
       let areaMinPrice  = null;
       const budgetWasActive = !!(max_price || min_price);
@@ -1300,7 +1316,7 @@ async function handleSearch(req, res) {
         );
 
         if (locationExistsInCatalog) {
-          // Location exists in catalog â†’ budget is the problem, not a wrong area name.
+          // Location exists in catalog â†' budget is the problem, not a wrong area name.
           // Mark budget_too_low immediately (no API needed for this decision).
           budgetTooLow = true;
 
@@ -1492,7 +1508,7 @@ async function handleSearch(req, res) {
           // If fallback also returned 0 results, proceed with original budget_too_low response
           console.log(`[Integration] fallback-search returned 0 results â€” returning budget_too_low`);
         } else {
-          // Location not in catalog at all â†’ genuine "area doesn't exist" case
+          // Location not in catalog at all â†' genuine "area doesn't exist" case
           console.log(`[Integration] '${resolvedLocation}' not in catalog for ${resolvedCity} â€” returning no_location_match`);
         }
       }
@@ -1787,7 +1803,7 @@ async function handleSearch(req, res) {
   const bufferedPageItems = validFiltered.slice(PAGE_SIZE).map(normalize);
 
   // has_more=true when:
-  //   (a) JLL's location filter was used and the raw page was full (20 results â†’ more pages likely)
+  //   (a) JLL's location filter was used and the raw page was full (20 results â†' more pages likely)
   //   (b) Client-side accumulation found more than PAGE_SIZE matches (we accumulated extras)
   //   (c) Client-side accumulation hit PAGE_SIZE exactly and the last JLL page was still full
   //       (more properties in the city/area to scan â€” caller can increment page to get more)
@@ -1890,7 +1906,7 @@ async function handleSearch(req, res) {
   // infinite loop of useless suggestions.
   //
   // Correct behaviour: return [] so the agent system-prompt rule fires:
-  //   "when search returns data=[] with no suggested_areas â†’ call areas_by_budget
+  //   "when search returns data=[] with no suggested_areas â†' call areas_by_budget
   //    immediately to find real areas with this property type and budget."
   // The areas_by_budget endpoint actually scans JLL and only returns areas that
   // have matching inventory â€” it's the only source of truth for this.
@@ -2004,7 +2020,7 @@ router.get('/proxy/property-resolve', async (req, res) => {
   }
 
   console.log(
-    `[Integration] property_resolve â†’ city=${resolvedCity} name="${cleanedName}" ` +
+    `[Integration] property_resolve â†' city=${resolvedCity} name="${cleanedName}" ` +
     `location_hint=${location_hint || '-'} variants=${parsedVariants.length} call=${call_id || '-'}`
   );
 
@@ -2126,7 +2142,7 @@ router.get('/proxy/property/:slug', async (req, res) => {
   const { slug } = req.params;
   const { call_id, assistant_id, org_id } = req.query;
 
-  console.log(`[Integration] get_property_details â†’ slug=${slug} call=${call_id || '-'}`);
+  console.log(`[Integration] get_property_details â†' slug=${slug} call=${call_id || '-'}`);
 
   let data = null, error = null;
   try {
@@ -2324,7 +2340,7 @@ function _normalizeAreaKey(name) {
 
 function filterByProximity(areas, city, nearLocation, startKm = 5, stepKm = 5, maxKm = 30, minResults = 3) {
   const cityCoords = AREA_COORDS[city] || {};
-  // Try exact key first, then normalized (handles "T.Nagar" â†’ "T Nagar", "T. Nagar" â†’ "T Nagar")
+  // Try exact key first, then normalized (handles "T.Nagar" â†' "T Nagar", "T. Nagar" â†' "T Nagar")
   const _normNear = _normalizeAreaKey(nearLocation);
   const originCoords = cityCoords[nearLocation]
     || cityCoords[_normNear]
@@ -2384,13 +2400,22 @@ async function handleAreasByBudget(req, res) {
   }
 
   const resolvedCity = resolveCatalogName(city, 'city') || city || '';
-  const resolvedType = property_type ? (resolveCatalogName(property_type, 'property_type', resolvedCity) || property_type) : '';
+  const _TYPE_MAP_ABB = {
+    'apartment': 'Apartments', 'apartments': 'Apartments', 'flat': 'Apartments', 'flats': 'Apartments',
+    'villa': 'Villas', 'villas': 'Villas', 'independent house': 'Villas',
+    'plot': 'Plot', 'plots': 'Plot', 'land': 'Plot', 'site': 'Plot',
+  };
+  const resolvedType = property_type
+    ? (resolveCatalogName(property_type, 'property_type', resolvedCity) ||
+       _TYPE_MAP_ABB[property_type.toLowerCase()] ||
+       (property_type.charAt(0).toUpperCase() + property_type.slice(1).toLowerCase()))
+    : '';
   
   const maxPrice = max_price ? Number(max_price) : null;
   const minPrice = min_price ? Number(min_price) : null;
 
   console.log(
-    `[Integration] areas_by_budget â†’ city=${resolvedCity} ` +
+    `[Integration] areas_by_budget â†' city=${resolvedCity} ` +
     `type=${resolvedType || '-'} budget=${minPrice || 0}-${maxPrice || 'âˆž'} ` +
     `call=${call_id || '-'}`
   );
@@ -2494,7 +2519,7 @@ async function handleAreasByBudget(req, res) {
     radiusUsed = r;
     console.log(
       `[Integration] areas_by_budget proximity: near='${resolvedNearLocation}' ` +
-      `radius=${radiusUsed}km â†’ ${finalAreas.length} areas`
+      `radius=${radiusUsed}km â†' ${finalAreas.length} areas`
     );
   }
 
@@ -2563,3 +2588,4 @@ router.post('/catalog/reload', (req, res) => {
 });
 
 module.exports = router;
+module.exports.reloadCatalog = reloadCatalog;

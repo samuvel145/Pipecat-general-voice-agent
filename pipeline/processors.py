@@ -11,6 +11,8 @@ import time
 
 from pipecat.frames.frames import (
     AudioRawFrame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     InterimTranscriptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -37,6 +39,67 @@ from logger import (
 )
 
 audio_log = get_logger("audio_in")
+
+_echo_log = get_logger("echo_gate")
+
+
+class EchoCancelGate(FrameProcessor):
+    """
+    Placed immediately after transport.input().
+    Drops AudioRawFrames while the bot's TTS is playing so the
+    microphone cannot pick up the speaker output and cause the STT
+    to transcribe the bot's own voice.
+
+    TTSSpeakingTracker (placed after the TTS service) calls
+    set_bot_speaking() directly to open/close the gate.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bot_speaking: bool = False
+
+    def set_bot_speaking(self, active: bool) -> None:
+        if active != self._bot_speaking:
+            _echo_log.debug("EchoCancelGate: bot_speaking=%s", active)
+        self._bot_speaking = active
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, AudioRawFrame) and self._bot_speaking:
+            return  # swallow mic audio while bot is speaking
+        await self.push_frame(frame, direction)
+
+
+class TTSSpeakingTracker(FrameProcessor):
+    """
+    Placed after the TTS service in the pipeline.
+    Keys off BotStartedSpeakingFrame / BotStoppedSpeakingFrame — fired by the
+    transport output when audio actually starts/stops playing (not when synthesis
+    finishes), so the gate stays closed for the full duration of playback.
+    A 400 ms tail delay absorbs speaker ring-down after playback ends.
+    """
+
+    def __init__(self, gate: "EchoCancelGate", **kwargs):
+        super().__init__(**kwargs)
+        self._gate = gate
+        self._stop_handle = None
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            if self._stop_handle:
+                self._stop_handle.cancel()
+                self._stop_handle = None
+            self._gate.set_bot_speaking(True)
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if self._stop_handle:
+                self._stop_handle.cancel()
+            self._stop_handle = loop.call_later(
+                0.4, lambda: self._gate.set_bot_speaking(False)
+            )
+        await self.push_frame(frame, direction)
 
 _func_log = get_logger("filter")
 

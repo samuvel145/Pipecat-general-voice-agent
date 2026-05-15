@@ -25,6 +25,18 @@ app.use('/api/integration', integrationRouter);
 // Health check
 app.get('/', (_req, res) => res.json({ status: 'JLL proxy running', port: PORT }));
 
+// Catalog hot-reload (called by sync-catalog.js after writing new catalog)
+app.post('/api/integration/catalog/reload', (_req, res) => {
+  try {
+    const integration = require('./integration (1).js');
+    if (typeof integration.reloadCatalog === 'function') integration.reloadCatalog();
+    console.log('[Proxy] Catalog hot-reloaded');
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ JLL Integration Proxy listening on http://localhost:${PORT}`);
