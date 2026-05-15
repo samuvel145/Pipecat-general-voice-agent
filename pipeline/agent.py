@@ -37,7 +37,7 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, STTLogProcessor, TextNormalizerProcessor, TTSSpeakingTracker
+from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, PhoneticCorrectorProcessor, STTLogProcessor, TextNormalizerProcessor, TTSSpeakingTracker
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
@@ -124,12 +124,13 @@ async def run_agent() -> None:
 
     # ── Pipeline assembly ─────────────────────────────────────────────────────
     log_pipeline_event("PIPELINE", "Assembling pipeline stages")
-    func_filter     = FunctionCallFilter()
-    text_normalizer = TextNormalizerProcessor()
-    stt_log         = STTLogProcessor()          # logs user speech BEFORE aggregator consumes it
-    conv_log        = ConversationLogProcessor() # logs LLM response + TTS label
-    echo_gate       = EchoCancelGate()           # mutes mic while bot TTS is playing
-    tts_tracker     = TTSSpeakingTracker(gate=echo_gate)  # signals gate on TTS start/stop
+    func_filter        = FunctionCallFilter()
+    text_normalizer    = TextNormalizerProcessor()
+    stt_log            = STTLogProcessor()          # logs user speech BEFORE aggregator consumes it
+    conv_log           = ConversationLogProcessor() # logs LLM response + TTS label
+    echo_gate          = EchoCancelGate()           # mutes mic while bot TTS is playing
+    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)  # signals gate on TTS start/stop
+    phonetic_corrector = PhoneticCorrectorProcessor(context=context)  # Soundex+Metaphone name/location fix
 
     pipeline = Pipeline(
         [
@@ -137,15 +138,16 @@ async def run_agent() -> None:
             echo_gate,                       # 2. 🔇 Drop mic frames while bot speaks
             stt,                             # 3. Azure STT → TranscriptionFrame
             stt_log,                         # 4. 📝 STT log (before aggregator consumes frame)
-            context_aggregator.user(),       # 5. Accumulate user turn
-            llm,                             # 6. Azure OpenAI LLM
-            func_filter,                     # 7. Drop function-call markup
-            conv_log,                        # 8. 🤖 LLM + 🔊 TTS log
-            text_normalizer,                 # 9. Number normalisation
-            tts,                             # 10. Cartesia TTS
-            transport.output(),              # 11. Speaker (fires BotStarted/StoppedSpeakingFrame)
-            tts_tracker,                     # 12. 🔊 Signal gate after actual playback starts/stops
-            context_aggregator.assistant(),  # 13. Store assistant turn
+            phonetic_corrector,              # 5. Phonetic correction for names + locations
+            context_aggregator.user(),       # 6. Accumulate user turn
+            llm,                             # 7. Azure OpenAI LLM
+            func_filter,                     # 8. Drop function-call markup
+            conv_log,                        # 9. 🤖 LLM + 🔊 TTS log
+            text_normalizer,                 # 10. Number normalisation
+            tts,                             # 11. Cartesia TTS
+            transport.output(),              # 12. Speaker (fires BotStarted/StoppedSpeakingFrame)
+            tts_tracker,                     # 13. 🔊 Signal gate after actual playback starts/stops
+            context_aggregator.assistant(),  # 14. Store assistant turn
         ]
     )
 
