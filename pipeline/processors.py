@@ -91,15 +91,24 @@ class TTSSpeakingTracker(FrameProcessor):
             if self._stop_handle:
                 self._stop_handle.cancel()
                 self._stop_handle = None
+            _TurnLatency.stamp("bot_started")
+            e2e_ms = (
+                (_TurnLatency.bot_started - _TurnLatency.vad_start) * 1000
+                if _TurnLatency.vad_start else 0
+            )
+            _echo_log.info("Bot started speaking  e2e=%.0fms", e2e_ms)
             self._gate.set_bot_speaking(True)
         elif isinstance(frame, BotStoppedSpeakingFrame):
             import asyncio
             loop = asyncio.get_event_loop()
             if self._stop_handle:
                 self._stop_handle.cancel()
+            # 200ms tail delay — absorbs speaker ring-down without blocking mic too long
             self._stop_handle = loop.call_later(
-                0.4, lambda: self._gate.set_bot_speaking(False)
+                0.2, lambda: self._gate.set_bot_speaking(False)
             )
+            _TurnLatency.stamp("bot_stopped")
+            _TurnLatency.log_summary()   # print full report at end of each bot turn
         await self.push_frame(frame, direction)
 
 _func_log = get_logger("filter")
@@ -289,18 +298,100 @@ class TextNormalizerProcessor(FrameProcessor):
 
 
 class VADLogProcessor(FrameProcessor):
-    """Logs VAD speech-start / speech-end frames."""
+    """Logs VAD speech-start / speech-end frames and resets the turn latency clock."""
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            _TurnLatency.reset()   # t=0 for this turn
             log_vad_event(speech_detected=True)
         elif isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
             log_vad_event(speech_detected=False)
         await self.push_frame(frame, direction)
 
 
-# ── Shared turn state between STT and Conv log processors ────────────────────
+# ── Shared turn state + per-turn latency tracker ─────────────────────────────
+
+_lat_log = get_logger("latency")
+
+
+class _TurnLatency:
+    """
+    Module-level stopwatch. Every processor stamps its milestone here.
+    TTSSpeakingTracker prints the full summary when the bot stops speaking.
+
+    All times are from time.monotonic(); deltas logged in milliseconds.
+    """
+    vad_start:       float = 0.0   # VADUserStartedSpeakingFrame
+    stt_done:        float = 0.0   # TranscriptionFrame received from STT
+    phonetic_done:   float = 0.0   # PhoneticCorrectorProcessor pushed frame
+    llm_first_token: float = 0.0   # First LLMTextFrame
+    llm_done:        float = 0.0   # LLMFullResponseEndFrame
+    tts_first_chunk: float = 0.0   # First TTSAudioRawFrame
+    bot_started:     float = 0.0   # BotStartedSpeakingFrame (actual playback)
+    bot_stopped:     float = 0.0   # BotStoppedSpeakingFrame
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.vad_start       = time.monotonic()
+        cls.stt_done        = 0.0
+        cls.phonetic_done   = 0.0
+        cls.llm_first_token = 0.0
+        cls.llm_done        = 0.0
+        cls.tts_first_chunk = 0.0
+        cls.bot_started     = 0.0
+        cls.bot_stopped     = 0.0
+
+    @classmethod
+    def stamp(cls, milestone: str) -> None:
+        setattr(cls, milestone, time.monotonic())
+
+    @classmethod
+    def log_summary(cls) -> None:
+        if not cls.vad_start:
+            return
+        ref = cls.vad_start
+
+        def ms(t: float) -> str:
+            return f"{(t - ref) * 1000:.0f}ms" if t else "—"
+
+        def diff(a: float, b: float) -> str:
+            return f"{(b - a) * 1000:.0f}ms" if (a and b) else "—"
+
+        _lat_log.info(
+            "\n"
+            "┌─────────────────────────────────────────┐\n"
+            "│           TURN LATENCY REPORT           │\n"
+            "├─────────────────────────────┬───────────┤\n"
+            "│ VAD speech detected         │ t=0       │\n"
+            "│ STT result received         │ t=%-7s │\n"
+            "│ Phonetic correction done    │ t=%-7s │\n"
+            "│ LLM first token             │ t=%-7s │\n"
+            "│ LLM generation complete     │ t=%-7s │\n"
+            "│ TTS first audio chunk       │ t=%-7s │\n"
+            "│ Bot started speaking        │ t=%-7s │\n"
+            "│ Bot stopped speaking        │ t=%-7s │\n"
+            "├─────────────────────────────┴───────────┤\n"
+            "│ STT latency        : %-8s             │\n"
+            "│ Phonetic correction: %-8s             │\n"
+            "│ LLM first token    : %-8s             │\n"
+            "│ LLM full response  : %-8s             │\n"
+            "│ TTS to first chunk : %-8s             │\n"
+            "│ E2E (VAD→audio)    : %-8s             │\n"
+            "│ Bot speaking time  : %-8s             │\n"
+            "└─────────────────────────────────────────┘",
+            ms(cls.stt_done), ms(cls.phonetic_done), ms(cls.llm_first_token),
+            ms(cls.llm_done), ms(cls.tts_first_chunk), ms(cls.bot_started), ms(cls.bot_stopped),
+            diff(cls.vad_start,       cls.stt_done),
+            diff(cls.stt_done,        cls.phonetic_done),
+            diff(cls.stt_done,        cls.llm_first_token),
+            diff(cls.llm_first_token, cls.llm_done),
+            diff(cls.llm_done,        cls.tts_first_chunk),
+            diff(cls.vad_start,       cls.bot_started),
+            diff(cls.bot_started,     cls.bot_stopped),
+        )
+
+
 class _TurnState:
     """Module-level shared state so processors at different pipeline positions
     can coordinate turn IDs and pipeline state."""
@@ -316,20 +407,20 @@ class _TurnState:
 
 class STTLogProcessor(FrameProcessor):
     """Bolt-style STT + turn tracking.
-    Must be placed BEFORE context_aggregator.user() (position 3) so it sees
+    Must be placed BEFORE context_aggregator.user() so it sees
     TranscriptionFrame before the aggregator consumes it.
     """
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            _TurnLatency.stamp("stt_done")
+            stt_ms = (_TurnLatency.stt_done - _TurnLatency.vad_start) * 1000 if _TurnLatency.vad_start else 0
             _TurnState.turn_id += 1
             _TurnState.transition("listening")
+            get_logger("agent").info("[TURN] id=%d", _TurnState.turn_id)
             get_logger("agent").info(
-                "[TURN] id=%d", _TurnState.turn_id
-            )
-            get_logger("agent").info(
-                "[STT]  final=%r", frame.text.strip()
+                "[STT]  final=%r  stt_latency=%.0fms", frame.text.strip(), stt_ms
             )
         await self.push_frame(frame, direction)
 
@@ -358,11 +449,24 @@ class LLMLogProcessor(FrameProcessor):
 class TTSLogProcessor(FrameProcessor):
     """Logs TTS audio chunks and synthesis lifecycle."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._first_chunk_logged = False
+
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSStartedFrame):
-            get_logger("tts").info("🗣  TTS synthesis started")
+            self._first_chunk_logged = False
+            get_logger("tts").info("TTS synthesis started")
         elif isinstance(frame, TTSAudioRawFrame):
+            if not self._first_chunk_logged:
+                _TurnLatency.stamp("tts_first_chunk")
+                tts_ms = (
+                    (_TurnLatency.tts_first_chunk - _TurnLatency.llm_done) * 1000
+                    if _TurnLatency.llm_done else 0
+                )
+                get_logger("tts").info("TTS first chunk ready  tts_latency=%.0fms", tts_ms)
+                self._first_chunk_logged = True
             log_tts_chunk(len(frame.audio))
         elif isinstance(frame, TTSStoppedFrame):
             log_tts_complete()
@@ -691,14 +795,21 @@ class PhoneticCorrectorProcessor(FrameProcessor):
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            t0 = time.monotonic()
             awaiting_name, awaiting_location = self._detect_context()
             corrected = self._correct(frame.text, awaiting_name, awaiting_location)
+            elapsed_us = (time.monotonic() - t0) * 1_000_000
+            _TurnLatency.stamp("phonetic_done")
             if corrected != frame.text:
-                _phon_log.info("[PHONETIC] %r → %r", frame.text, corrected)
+                _phon_log.info(
+                    "[PHONETIC] %r → %r  (%.0fµs)", frame.text, corrected, elapsed_us
+                )
                 try:
                     frame = dataclasses.replace(frame, text=corrected)
                 except Exception:
                     pass
+            else:
+                _phon_log.debug("[PHONETIC] no change (%.0fµs)", elapsed_us)
         await self.push_frame(frame, direction)
 
 
@@ -731,12 +842,14 @@ class ConversationLogProcessor(FrameProcessor):
         elif isinstance(frame, LLMTextFrame) and frame.text:
             if not self._llm_first_token_ts:
                 self._llm_first_token_ts = time.monotonic()
+                _TurnLatency.stamp("llm_first_token")
                 first_token_ms = (self._llm_first_token_ts - self._llm_start_ts) * 1000
                 _conv_log.info("[LLM]  first_token=%.0fms", first_token_ms)
             self._agent_buf.append(frame.text)
 
         # ── LLM done → log full response + TTS ──────────────────────────────
         elif isinstance(frame, LLMFullResponseEndFrame):
+            _TurnLatency.stamp("llm_done")
             full_text = "".join(self._agent_buf).strip()
             if full_text:
                 total_ms = (time.monotonic() - self._llm_start_ts) * 1000

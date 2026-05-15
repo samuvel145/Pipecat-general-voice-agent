@@ -37,7 +37,7 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, PhoneticCorrectorProcessor, STTLogProcessor, TextNormalizerProcessor, TTSSpeakingTracker
+from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, PhoneticCorrectorProcessor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
@@ -126,28 +126,32 @@ async def run_agent() -> None:
     log_pipeline_event("PIPELINE", "Assembling pipeline stages")
     func_filter        = FunctionCallFilter()
     text_normalizer    = TextNormalizerProcessor()
-    stt_log            = STTLogProcessor()          # logs user speech BEFORE aggregator consumes it
+    stt_log            = STTLogProcessor()          # logs user speech + stt latency
     conv_log           = ConversationLogProcessor() # logs LLM response + TTS label
+    tts_log            = TTSLogProcessor()          # logs TTS first chunk latency
+    vad_log            = VADLogProcessor()          # resets latency clock on speech start
     echo_gate          = EchoCancelGate()           # mutes mic while bot TTS is playing
-    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)  # signals gate on TTS start/stop
+    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)  # signals gate; prints latency report
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)  # Soundex+Metaphone name/location fix
 
     pipeline = Pipeline(
         [
             transport.input(),               # 1. Raw mic
-            echo_gate,                       # 2. 🔇 Drop mic frames while bot speaks
-            stt,                             # 3. Azure STT → TranscriptionFrame
-            stt_log,                         # 4. 📝 STT log (before aggregator consumes frame)
-            phonetic_corrector,              # 5. Phonetic correction for names + locations
-            context_aggregator.user(),       # 6. Accumulate user turn
-            llm,                             # 7. Azure OpenAI LLM
-            func_filter,                     # 8. Drop function-call markup
-            conv_log,                        # 9. 🤖 LLM + 🔊 TTS log
-            text_normalizer,                 # 10. Number normalisation
-            tts,                             # 11. Cartesia TTS
-            transport.output(),              # 12. Speaker (fires BotStarted/StoppedSpeakingFrame)
-            tts_tracker,                     # 13. 🔊 Signal gate after actual playback starts/stops
-            context_aggregator.assistant(),  # 14. Store assistant turn
+            echo_gate,                       # 2. Drop mic frames while bot speaks
+            vad_log,                         # 3. Reset latency clock on VAD speech start
+            stt,                             # 4. Azure STT → TranscriptionFrame
+            stt_log,                         # 5. STT log + stt_latency stamp
+            phonetic_corrector,              # 6. Phonetic correction for names + locations
+            context_aggregator.user(),       # 7. Accumulate user turn
+            llm,                             # 8. Azure OpenAI LLM
+            func_filter,                     # 9. Drop function-call markup
+            conv_log,                        # 10. LLM log + llm_first_token / llm_done stamps
+            text_normalizer,                 # 11. Number normalisation
+            tts,                             # 12. Cartesia TTS
+            tts_log,                         # 13. TTS first chunk stamp
+            transport.output(),              # 14. Speaker (fires BotStarted/StoppedSpeakingFrame)
+            tts_tracker,                     # 15. Echo gate + full latency report on bot stop
+            context_aggregator.assistant(),  # 16. Store assistant turn
         ]
     )
 
