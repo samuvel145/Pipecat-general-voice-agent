@@ -10,3 +10,5 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+node_modules/
+data/jll-catalog.json
