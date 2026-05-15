@@ -146,69 +146,80 @@ _norm_log = get_logger("normalizer")
 
 class TextNormalizerProcessor(FrameProcessor):
     """
-    Converts comma-formatted numbers in LLMTextFrame text to spoken words
+    Converts comma-formatted Indian numbers in LLM output to spoken words
     before the frame reaches TTS.
 
-    Examples (Indian real-estate context):
+    Examples:
       ₹1,00,00,000  →  "1 crore"
       ₹50,00,000    →  "50 lakhs"
-      ₹5,00,000     →  "5 lakhs"
+      ₹20,00,000    →  "20 lakhs"
       50,000        →  "50 thousand"
-      1,500         →  "1500"
 
-    Streaming-safe: processes each token independently; no buffering needed
-    because the comma pattern is almost never split across tokens.
+    Buffers tokens into complete sentences before normalising so that
+    prices like ₹20,00,000 streamed as "₹20" + ",00,000" across multiple
+    tokens are always seen as a whole.
     """
 
-    # Currency prefix  (₹ / Rs / Rs.)  followed by optional whitespace
+    # Currency prefix (₹ / Rs / Rs.) + Indian comma-formatted number
     _CURRENCY_RE = re.compile(
         r'[₹]\s*(\d{1,3}(?:,\d{2,3})+)|'
-        r'(?:Rs\.?\s*)(\d{1,3}(?:,\d{2,3})+)'
+        r'(?:Rs\.?\s*)(\d{1,3}(?:,\d{2,3})+)',
+        re.IGNORECASE,
     )
-    # Bare comma-separated numbers NOT preceded by a currency symbol
-    _NUMBER_RE = re.compile(r'(?<![₹\d])(\d{1,3}(?:,\d{2,3})+)(?!\d)')
+    # Bare comma-separated Indian numbers not already preceded by a currency symbol
+    _NUMBER_RE = re.compile(r'(?<![₹\d,])(\d{1,3}(?:,\d{2,3})+)(?!\d)')
+
+    # Sentence-ending punctuation — flush buffer when we see one of these
+    _SENTENCE_END_RE = re.compile(r'[.!?]')
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buf: str = ""
 
     @staticmethod
     def _to_words(num_str: str) -> str:
-        """Convert a comma-formatted number string to Indian-style spoken words."""
         try:
             n = int(num_str.replace(',', ''))
         except ValueError:
             return num_str
-
-        if n >= 10_000_000:          # crore
+        if n >= 10_000_000:
             val = n / 10_000_000
-            label = f"{int(val)} crore" if val == int(val) else f"{val:.1f} crore"
-        elif n >= 100_000:           # lakh
+            return f"{int(val)} crore" if val == int(val) else f"{val:.1f} crore"
+        if n >= 100_000:
             val = n / 100_000
-            label = f"{int(val)} lakhs" if val == int(val) else f"{val:.1f} lakhs"
-        elif n >= 1_000:             # thousand
+            return f"{int(val)} lakh" if val == int(val) else f"{val:.1f} lakh"
+        if n >= 1_000:
             val = n / 1_000
-            label = f"{int(val)} thousand" if val == int(val) else f"{val:.1f} thousand"
-        else:
-            label = str(n)
-        return label
+            return f"{int(val)} thousand" if val == int(val) else f"{val:.1f} thousand"
+        return str(n)
 
     def _normalise(self, text: str) -> str:
-        # Replace currency + number (e.g. ₹50,00,000 → "50 lakhs")
         def _repl_currency(m: re.Match) -> str:
-            num_str = m.group(1) or m.group(2)
-            return self._to_words(num_str)
-
+            return self._to_words(m.group(1) or m.group(2))
         text = self._CURRENCY_RE.sub(_repl_currency, text)
-
-        # Replace any remaining bare comma-numbers (e.g. 50,000 → "50 thousand")
         text = self._NUMBER_RE.sub(lambda m: self._to_words(m.group(1)), text)
         return text
+
+    async def _flush(self, direction: FrameDirection) -> None:
+        if self._buf:
+            normalised = self._normalise(self._buf)
+            if normalised != self._buf:
+                _norm_log.debug("Normalised: %r → %r", self._buf, normalised)
+            await self.push_frame(LLMTextFrame(text=normalised), direction)
+            self._buf = ""
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMTextFrame) and frame.text:
-            normalised = self._normalise(frame.text)
-            if normalised != frame.text:
-                _norm_log.debug("Normalised: %r → %r", frame.text, normalised)
-                frame = LLMTextFrame(text=normalised)
+            self._buf += frame.text
+            # Flush on sentence boundary so Cartesia still starts early
+            if self._SENTENCE_END_RE.search(frame.text):
+                await self._flush(direction)
+            return
+
+        if isinstance(frame, LLMFullResponseEndFrame):
+            await self._flush(direction)
 
         await self.push_frame(frame, direction)
 
