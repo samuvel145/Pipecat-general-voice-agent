@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import random
+import struct
 
 from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -37,10 +40,32 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, PhoneticCorrectorProcessor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor
+from pipeline.processors import ConversationLogProcessor, EchoCancelGate, FunctionCallFilter, PhoneticCorrectorProcessor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, TypingSoundGate, TypingSoundProcessor, VADLogProcessor
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
+
+
+def _gen_keyboard_pcm(sample_rate: int) -> bytes:
+    """Synthesise ~4 s of keyboard-typing sound as 16-bit mono PCM (fixed seed)."""
+    rng = random.Random(42)
+    n   = int(4.0 * sample_rate)
+    buf = [0.0] * n
+    t   = 0
+    while t < n:
+        click_len = int(rng.uniform(0.008, 0.014) * sample_rate)
+        vol       = rng.uniform(0.28, 0.50)
+        for i in range(min(click_len, n - t)):
+            noise      = rng.gauss(0, 1.0)
+            decay      = math.exp(-i / max(1, click_len * 0.18))
+            buf[t + i] = max(-1.0, min(1.0, buf[t + i] + noise * decay * vol))
+        t += int(rng.uniform(0.08, 0.20) * sample_rate)
+    peak  = max(abs(x) for x in buf) or 1.0
+    scale = 0.45 / peak
+    return struct.pack(
+        f'<{n}h',
+        *(max(-32768, min(32767, int(x * scale * 32767))) for x in buf),
+    )
 
 
 async def run_agent() -> None:
@@ -122,6 +147,19 @@ async def run_agent() -> None:
     # ── Tool handler ──────────────────────────────────────────────────────────
     tool_handler = JLLToolHandler()
 
+    # ── Typing sound (pre-generate PCM once at startup) ───────────────────────
+    _keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
+    log.info("[SOUND] Keyboard PCM ready  %.1fs  %d bytes", 4.0, len(_keyboard_pcm))
+    # TypingSoundGate owns the PCM loop and sits just before transport.output().
+    # It pushes AudioRawFrame directly downstream so keyboard audio never touches STT.
+    typing_sound_gate = TypingSoundGate(
+        keyboard_pcm=_keyboard_pcm,
+        sample_rate=settings.SAMPLE_RATE,
+    )
+    # TypingSoundProcessor (position 6) is a thin signaler: on TranscriptionFrame
+    # it calls typing_sound_gate.start_kb(); on user-started-speaking it calls stop_kb().
+    typing_sound = TypingSoundProcessor(typing_sound_gate=typing_sound_gate)
+
     # ── Pipeline assembly ─────────────────────────────────────────────────────
     log_pipeline_event("PIPELINE", "Assembling pipeline stages")
     func_filter        = FunctionCallFilter()
@@ -130,28 +168,33 @@ async def run_agent() -> None:
     conv_log           = ConversationLogProcessor() # logs LLM response + TTS label
     tts_log            = TTSLogProcessor()          # logs TTS first chunk latency
     vad_log            = VADLogProcessor()          # resets latency clock on speech start
-    echo_gate          = EchoCancelGate()           # mutes mic while bot TTS is playing
-    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)  # signals gate; prints latency report
+    echo_gate          = EchoCancelGate()           # mutes mic while bot audio is playing
+    # TTSSpeakingTracker: closes gate on BotStartedSpeakingFrame, opens after
+    # BotStoppedSpeakingFrame (200 ms delay). No longer calls stop_kb() —
+    # TypingSoundGate handles keyboard stop on first real TTS audio.
+    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)  # Soundex+Metaphone name/location fix
 
     pipeline = Pipeline(
         [
-            transport.input(),               # 1. Raw mic
-            echo_gate,                       # 2. Drop mic frames while bot speaks
-            vad_log,                         # 3. Reset latency clock on VAD speech start
-            stt,                             # 4. Azure STT → TranscriptionFrame
-            stt_log,                         # 5. STT log + stt_latency stamp
-            phonetic_corrector,              # 6. Phonetic correction for names + locations
-            context_aggregator.user(),       # 7. Accumulate user turn
-            llm,                             # 8. Azure OpenAI LLM
-            func_filter,                     # 9. Drop function-call markup
-            conv_log,                        # 10. LLM log + llm_first_token / llm_done stamps
-            text_normalizer,                 # 11. Number normalisation
-            tts,                             # 12. Cartesia TTS
-            tts_log,                         # 13. TTS first chunk stamp
-            transport.output(),              # 14. Speaker (fires BotStarted/StoppedSpeakingFrame)
-            tts_tracker,                     # 15. Echo gate + full latency report on bot stop
-            context_aggregator.assistant(),  # 16. Store assistant turn
+            transport.input(),               # 1.  Raw mic
+            echo_gate,                       # 2.  Drop mic frames while bot speaks
+            vad_log,                         # 3.  Reset latency clock on VAD speech start
+            stt,                             # 4.  Azure STT → TranscriptionFrame
+            stt_log,                         # 5.  STT log + stt_latency stamp
+            typing_sound,                    # 6.  Signals typing_sound_gate on TranscriptionFrame
+            phonetic_corrector,              # 7.  Phonetic correction for names + locations
+            context_aggregator.user(),       # 8.  Accumulate user turn
+            llm,                             # 9.  Azure OpenAI LLM
+            func_filter,                     # 10. Drop function-call markup
+            conv_log,                        # 11. LLM log + llm_first_token / llm_done stamps
+            text_normalizer,                 # 12. Number normalisation
+            tts,                             # 13. Cartesia TTS
+            tts_log,                         # 14. TTS first chunk stamp
+            typing_sound_gate,               # 15. Keyboard PCM loop + seamless handoff to real TTS
+            transport.output(),              # 16. Speaker (fires BotStarted/StoppedSpeakingFrame)
+            tts_tracker,                     # 17. Echo gate control + latency report
+            context_aggregator.assistant(),  # 18. Store assistant turn
         ]
     )
 
