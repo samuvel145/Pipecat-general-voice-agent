@@ -8,6 +8,7 @@ passing through without modifying them (transparent pass-through).
 
 import asyncio
 import dataclasses
+import random
 import re
 import time
 
@@ -139,26 +140,33 @@ class TypingSoundProcessor(FrameProcessor):
     """
     Thin signal router at pipeline position 6 (after STT).
 
-    Tells TypingSoundGate when to start / cancel the keyboard loop:
-      TranscriptionFrame            → gate.start_kb()
-      VADUserStartedSpeakingFrame   → gate.stop_kb()   (user speaks again)
-      UserStartedSpeakingFrame      → gate.stop_kb()
+    On TranscriptionFrame:
+      1. Pre-closes EchoCancelGate so the mic is muted before the first
+         audio chunk plays — prevents ack phrase speech from being picked
+         up by the mic and re-transcribed.
+      2. Calls typing_sound_gate.start_kb() to begin ack phrase + keyboard.
 
-    Keyboard PCM is owned and played by TypingSoundGate (position ~15),
-    which pushes AudioRawFrame directly to transport.output() so the audio
-    never passes through STT or any other upstream processor.
+    On user-started-speaking: cancels the keyboard immediately.
     """
 
-    def __init__(self, typing_sound_gate: "TypingSoundGate", **kwargs):
+    def __init__(
+        self,
+        typing_sound_gate: "TypingSoundGate",
+        echo_gate: "EchoCancelGate",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        self._gate = typing_sound_gate
+        self._typing_gate = typing_sound_gate
+        self._echo_gate = echo_gate
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            self._gate.start_kb()
+            # Mute mic before first audio chunk plays — no echo window
+            self._echo_gate.set_bot_speaking(True)
+            self._typing_gate.start_kb()
         elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
-            self._gate.stop_kb("user speaking again")
+            self._typing_gate.stop_kb("user speaking again")
         await self.push_frame(frame, direction)
 
 
@@ -178,19 +186,38 @@ class TypingSoundGate(FrameProcessor):
       stop_kb() (early)  — called by TypingSoundProcessor if user speaks again
     """
 
-    def __init__(self, keyboard_pcm: bytes, sample_rate: int, **kwargs):
+    def __init__(
+        self,
+        keyboard_pcm: bytes,
+        sample_rate: int,
+        ack_pcms: list[bytes] | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._pcm = keyboard_pcm
         self._sample_rate = sample_rate
         self._kb_task: asyncio.Task | None = None
         self._tts_seen: bool = False  # True once first real TTS frame passes
+        self._ack_pcms: list[bytes] = list(ack_pcms) if ack_pcms else []
+        self._ack_pool: list[bytes] = []  # shuffled draw pool, refilled when empty
+
+    def _next_ack(self) -> bytes | None:
+        if not self._ack_pcms:
+            return None
+        if not self._ack_pool:
+            self._ack_pool = list(self._ack_pcms)
+            random.shuffle(self._ack_pool)
+        return self._ack_pool.pop()
 
     def start_kb(self) -> None:
         if self._kb_task and not self._kb_task.done():
             return
         self._tts_seen = False
         _typing_log.info("[TYPING] sound START — masking STT+LLM+TTS latency")
-        self._kb_task = asyncio.create_task(self._keyboard_loop())
+        if self._ack_pcms:
+            self._kb_task = asyncio.create_task(self._ack_then_keyboard_loop())
+        else:
+            self._kb_task = asyncio.create_task(self._keyboard_loop())
 
     def stop_kb(self, reason: str = "stop") -> None:
         if self._kb_task and not self._kb_task.done():
@@ -200,6 +227,25 @@ class TypingSoundGate(FrameProcessor):
 
     def is_active(self) -> bool:
         return self._kb_task is not None and not self._kb_task.done()
+
+    async def _ack_then_keyboard_loop(self) -> None:
+        """Play one random ack phrase then seamlessly enter the keyboard loop.
+
+        CancelledError propagates naturally during ack (stop_kb / TTS handoff).
+        _keyboard_loop swallows CancelledError during the keyboard phase.
+        """
+        ack = self._next_ack()
+        if ack:
+            _typing_log.info("[ACK] playing acknowledgment phrase")
+            await self.push_frame(
+                OutputAudioRawFrame(audio=ack, sample_rate=self._sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            # Wait for the phrase to finish playing before starting keyboard.
+            # Duration = bytes / (sample_rate × 2 bytes per sample)
+            duration = len(ack) / (self._sample_rate * 2)
+            await asyncio.sleep(duration)
+        await self._keyboard_loop()
 
     async def _keyboard_loop(self) -> None:
         chunk = self._sample_rate * 2 * 20 // 1000  # 20 ms of 16-bit mono PCM
