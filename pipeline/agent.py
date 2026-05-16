@@ -45,6 +45,45 @@ from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
 
+_ACK_PHRASES = [
+    "Okay…", "Sure…", "Got it…", "Yeah…", "Alright…",
+    "Moving forward…", "Uh-huh…", "Understood…", "Let me check…", "One moment…",
+]
+
+
+async def _prefetch_ack_phrases(api_key: str, voice_id: str, sample_rate: int) -> list[bytes]:
+    """Pre-synthesize acknowledgment phrases via Cartesia /tts/bytes at startup."""
+    import httpx
+    pcm_list: list[bytes] = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for phrase in _ACK_PHRASES:
+            try:
+                resp = await client.post(
+                    "https://api.cartesia.ai/tts/bytes",
+                    headers={
+                        "X-API-Key": api_key,
+                        "Cartesia-Version": "2024-06-10",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model_id": "sonic-2",
+                        "transcript": phrase,
+                        "voice": {"mode": "id", "id": voice_id},
+                        "output_format": {
+                            "container": "raw",
+                            "encoding": "pcm_s16le",
+                            "sample_rate": sample_rate,
+                        },
+                    },
+                )
+                resp.raise_for_status()
+                pcm_list.append(resp.content)
+                log.info("[ACK] Pre-synthesized %r — %d bytes", phrase, len(resp.content))
+            except Exception as exc:
+                log.warning("[ACK] Skipped %r — %s", phrase, exc)
+    log.info("[ACK] %d / %d phrases ready", len(pcm_list), len(_ACK_PHRASES))
+    return pcm_list
+
 
 def _gen_keyboard_pcm(sample_rate: int) -> bytes:
     """Synthesise ~4 s of keyboard-typing sound as 16-bit mono PCM (fixed seed)."""
@@ -147,19 +186,6 @@ async def run_agent() -> None:
     # ── Tool handler ──────────────────────────────────────────────────────────
     tool_handler = JLLToolHandler()
 
-    # ── Typing sound (pre-generate PCM once at startup) ───────────────────────
-    _keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
-    log.info("[SOUND] Keyboard PCM ready  %.1fs  %d bytes", 4.0, len(_keyboard_pcm))
-    # TypingSoundGate owns the PCM loop and sits just before transport.output().
-    # It pushes AudioRawFrame directly downstream so keyboard audio never touches STT.
-    typing_sound_gate = TypingSoundGate(
-        keyboard_pcm=_keyboard_pcm,
-        sample_rate=settings.SAMPLE_RATE,
-    )
-    # TypingSoundProcessor (position 6) is a thin signaler: on TranscriptionFrame
-    # it calls typing_sound_gate.start_kb(); on user-started-speaking it calls stop_kb().
-    typing_sound = TypingSoundProcessor(typing_sound_gate=typing_sound_gate)
-
     # ── Pipeline assembly ─────────────────────────────────────────────────────
     log_pipeline_event("PIPELINE", "Assembling pipeline stages")
     func_filter        = FunctionCallFilter()
@@ -174,6 +200,29 @@ async def run_agent() -> None:
     # TypingSoundGate handles keyboard stop on first real TTS audio.
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)  # Soundex+Metaphone name/location fix
+
+    # ── Acknowledgment phrases (pre-synthesized via Cartesia at startup) ─────
+    log_pipeline_event("ACK", "Pre-synthesizing acknowledgment phrases via Cartesia")
+    ack_pcms = await _prefetch_ack_phrases(
+        settings.CARTESIA_API_KEY,
+        settings.CARTESIA_VOICE_ID,
+        settings.SAMPLE_RATE,
+    )
+
+    # ── Typing sound (pre-generate PCM once at startup) ───────────────────────
+    _keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
+    log.info("[SOUND] Keyboard PCM ready  %.1fs  %d bytes", 4.0, len(_keyboard_pcm))
+    typing_sound_gate = TypingSoundGate(
+        keyboard_pcm=_keyboard_pcm,
+        sample_rate=settings.SAMPLE_RATE,
+        ack_pcms=ack_pcms,
+    )
+    # TypingSoundProcessor pre-closes echo_gate before any audio plays, then
+    # signals typing_sound_gate to start ack phrase + keyboard loop.
+    typing_sound = TypingSoundProcessor(
+        typing_sound_gate=typing_sound_gate,
+        echo_gate=echo_gate,
+    )
 
     pipeline = Pipeline(
         [
