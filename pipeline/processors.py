@@ -6,6 +6,7 @@ Each processor sits between two pipeline stages and logs the frames
 passing through without modifying them (transparent pass-through).
 """
 
+import asyncio
 import dataclasses
 import re
 import time
@@ -18,6 +19,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    OutputAudioRawFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -73,43 +75,163 @@ class EchoCancelGate(FrameProcessor):
 
 class TTSSpeakingTracker(FrameProcessor):
     """
-    Placed after the TTS service in the pipeline.
-    Keys off BotStartedSpeakingFrame / BotStoppedSpeakingFrame — fired by the
-    transport output when audio actually starts/stops playing (not when synthesis
-    finishes), so the gate stays closed for the full duration of playback.
-    A 400 ms tail delay absorbs speaker ring-down after playback ends.
+    Placed after transport.output() in the pipeline.
+
+    Controls the echo-cancel gate (so mic is muted during bot audio) and
+    logs per-turn latency.  TypingSoundGate (position just before transport)
+    is responsible for stopping the keyboard at the exact moment real TTS
+    audio arrives — this class no longer calls stop_kb() at all.
+
+    Gate logic:
+      BotStartedSpeakingFrame  → close gate immediately (keyboard OR real TTS)
+      BotStoppedSpeakingFrame  → schedule gate-open after 200 ms tail delay
+
+    Latency:
+      TTSStartedFrame          → stamp bot_started; set _real_tts_active
+      BotStoppedSpeakingFrame  → log summary only when _real_tts_active
     """
 
     def __init__(self, gate: "EchoCancelGate", **kwargs):
         super().__init__(**kwargs)
         self._gate = gate
         self._stop_handle = None
+        self._real_tts_active: bool = False
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, BotStartedSpeakingFrame):
-            if self._stop_handle:
-                self._stop_handle.cancel()
-                self._stop_handle = None
+
+        if isinstance(frame, TTSStartedFrame):
+            # Real Cartesia synthesis started — stamp latency and arm the flag
+            self._real_tts_active = True
             _TurnLatency.stamp("bot_started")
             e2e_ms = (
                 (_TurnLatency.bot_started - _TurnLatency.vad_start) * 1000
                 if _TurnLatency.vad_start else 0
             )
-            _echo_log.info("Bot started speaking  e2e=%.0fms", e2e_ms)
+            _echo_log.info("TTS synthesis started  e2e=%.0fms", e2e_ms)
+
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            # Transport started playing audio (keyboard OR real TTS) — close gate
+            if self._stop_handle:
+                self._stop_handle.cancel()
+                self._stop_handle = None
             self._gate.set_bot_speaking(True)
+
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            import asyncio
             loop = asyncio.get_event_loop()
             if self._stop_handle:
                 self._stop_handle.cancel()
-            # 200ms tail delay — absorbs speaker ring-down without blocking mic too long
+            # 200 ms tail — absorbs speaker ring-down; cancelled if TTS restarts sooner
             self._stop_handle = loop.call_later(
                 0.2, lambda: self._gate.set_bot_speaking(False)
             )
-            _TurnLatency.stamp("bot_stopped")
-            _TurnLatency.log_summary()   # print full report at end of each bot turn
+            if self._real_tts_active:
+                _TurnLatency.stamp("bot_stopped")
+                _TurnLatency.log_summary()
+                self._real_tts_active = False
+
         await self.push_frame(frame, direction)
+
+_typing_log = get_logger("typing_sound")
+
+
+class TypingSoundProcessor(FrameProcessor):
+    """
+    Thin signal router at pipeline position 6 (after STT).
+
+    Tells TypingSoundGate when to start / cancel the keyboard loop:
+      TranscriptionFrame            → gate.start_kb()
+      VADUserStartedSpeakingFrame   → gate.stop_kb()   (user speaks again)
+      UserStartedSpeakingFrame      → gate.stop_kb()
+
+    Keyboard PCM is owned and played by TypingSoundGate (position ~15),
+    which pushes AudioRawFrame directly to transport.output() so the audio
+    never passes through STT or any other upstream processor.
+    """
+
+    def __init__(self, typing_sound_gate: "TypingSoundGate", **kwargs):
+        super().__init__(**kwargs)
+        self._gate = typing_sound_gate
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self._gate.start_kb()
+        elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            self._gate.stop_kb("user speaking again")
+        await self.push_frame(frame, direction)
+
+
+class TypingSoundGate(FrameProcessor):
+    """
+    Placed just before transport.output() (between tts_log and transport).
+
+    Owns the keyboard PCM loop.  Pushes plain AudioRawFrame *downstream*
+    (straight to transport.output()) from an asyncio task, so keyboard
+    audio never travels upstream through STT or any other processor.
+
+    Seamless handoff:
+      start_kb()         — called by TypingSoundProcessor on TranscriptionFrame
+      stop_kb()          — called on first real TTSAudioRawFrame from Cartesia
+                           (the keyboard's last chunk finishes, then TTS takes
+                           over with zero silence gap)
+      stop_kb() (early)  — called by TypingSoundProcessor if user speaks again
+    """
+
+    def __init__(self, keyboard_pcm: bytes, sample_rate: int, **kwargs):
+        super().__init__(**kwargs)
+        self._pcm = keyboard_pcm
+        self._sample_rate = sample_rate
+        self._kb_task: asyncio.Task | None = None
+        self._tts_seen: bool = False  # True once first real TTS frame passes
+
+    def start_kb(self) -> None:
+        if self._kb_task and not self._kb_task.done():
+            return
+        self._tts_seen = False
+        _typing_log.info("[TYPING] sound START — masking STT+LLM+TTS latency")
+        self._kb_task = asyncio.create_task(self._keyboard_loop())
+
+    def stop_kb(self, reason: str = "stop") -> None:
+        if self._kb_task and not self._kb_task.done():
+            _typing_log.info("[TYPING] sound STOP — %s", reason)
+            self._kb_task.cancel()
+        self._kb_task = None
+
+    def is_active(self) -> bool:
+        return self._kb_task is not None and not self._kb_task.done()
+
+    async def _keyboard_loop(self) -> None:
+        chunk = self._sample_rate * 2 * 20 // 1000  # 20 ms of 16-bit mono PCM
+        pos, n = 0, len(self._pcm)
+        try:
+            while True:
+                end  = pos + chunk
+                data = (self._pcm[pos:end] if end <= n
+                        else self._pcm[pos:] + self._pcm[:end - n])
+                pos  = end % n
+                # OutputAudioRawFrame is required by LocalAudioOutputTransport
+                # (transport_destination attribute comes through DataFrame→Frame).
+                # Pushed directly downstream so keyboard audio never enters STT.
+                await self.push_frame(
+                    OutputAudioRawFrame(audio=data, sample_rate=self._sample_rate, num_channels=1),
+                    FrameDirection.DOWNSTREAM,
+                )
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            pass
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        # First real Cartesia audio chunk: stop keyboard, then let TTS through
+        if isinstance(frame, TTSAudioRawFrame) and not self._tts_seen:
+            self._tts_seen = True
+            if self.is_active():
+                self.stop_kb("real TTS audio — seamless handoff")
+        elif isinstance(frame, TTSStoppedFrame):
+            self._tts_seen = False  # ready for next turn
+        await self.push_frame(frame, direction)
+
 
 _func_log = get_logger("filter")
 
