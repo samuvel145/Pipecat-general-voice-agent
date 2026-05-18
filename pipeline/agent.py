@@ -35,6 +35,9 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.azure.stt import AzureSTTService
 from pipecat.services.azure.llm import AzureLLMService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
+from pipecat.serializers.exotel import ExotelFrameSerializer
+from pipecat.processors.audio.vad_processor import VADProcessor
 
 from config import settings
 from logger import get_logger, log_pipeline_event
@@ -322,6 +325,212 @@ async def run_agent() -> None:
         await task.cancel()
         await jll_client.close_client()
         log.info("Agent stopped cleanly.")
+
+
+async def run_agent_ws(websocket, stream_sid: str = "") -> None:
+    """WebSocket pipeline for phone/remote clients (Exotel/Vodafone protocol).
+
+    Audio flows over WebSocket as base64-encoded PCM JSON frames:
+      {"event": "media", "media": {"payload": "<base64_pcm>"}}
+    This is the same Exotel Media Streams format used by Vodafone India.
+    ExotelFrameSerializer handles resampling between pipeline rate and 8 kHz.
+    """
+    log.info("[bold cyan]JLL Voice Agent (WebSocket) starting…[/bold cyan]")
+    log_pipeline_event("INIT", "Building WebSocket pipeline components")
+
+    # ── Transport — FastAPI WebSocket + Exotel serializer ────────────────────
+    serializer = ExotelFrameSerializer(stream_sid=stream_sid)
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=settings.SAMPLE_RATE,
+            audio_out_sample_rate=settings.SAMPLE_RATE,
+            audio_in_channels=settings.CHANNELS,
+            audio_out_channels=settings.CHANNELS,
+            audio_in_passthrough=True,  # pass frames downstream for VADProcessor
+            serializer=serializer,
+        ),
+    )
+
+    # ── VAD — explicit processor (WebSocket transport has no built-in VAD) ───
+    vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(
+                confidence=0.5,
+                start_secs=0.2,
+                stop_secs=float(settings.SILENCE_THRESHOLD_MS) / 1000,
+                min_volume=0.2,
+            )
+        )
+    )
+
+    # ── STT ───────────────────────────────────────────────────────────────────
+    from pipecat.transcriptions.language import Language
+    stt = AzureSTTService(
+        api_key=settings.AZURE_STT_KEY,
+        region=settings.AZURE_SPEECH_REGION,
+        language=Language.EN_IN,
+        sample_rate=settings.SAMPLE_RATE,
+    )
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+    llm = AzureLLMService(
+        api_key=settings.AZURE_OPENAI_API_KEY,
+        endpoint=settings.AZURE_OPENAI_ENDPOINT,
+        model=settings.AZURE_OPENAI_DEPLOYMENT,
+        settings=AzureLLMService.Settings(
+            max_tokens=settings.LLM_MAX_TOKENS,
+            temperature=settings.LLM_TEMPERATURE,
+        ),
+    )
+
+    # ── TTS ───────────────────────────────────────────────────────────────────
+    from pipecat.services.cartesia.tts import CartesiaTTSSettings
+    tts = CartesiaTTSService(
+        api_key=settings.CARTESIA_API_KEY,
+        sample_rate=settings.SAMPLE_RATE,
+        settings=CartesiaTTSSettings(
+            voice=settings.CARTESIA_VOICE_ID,
+            model="sonic-2",
+        ),
+    )
+
+    # ── Context ───────────────────────────────────────────────────────────────
+    system_prompt = build_system_prompt(settings.JLL_ASSISTANT_NAME)
+    context = LLMContext(
+        messages=[{"role": "system", "content": system_prompt}],
+        tools=ToolsSchema(
+            standard_tools=[],
+            custom_tools={AdapterType.OPENAI: TOOL_SCHEMAS},
+        ),
+    )
+    context_aggregator = LLMContextAggregatorPair(context=context)
+    tool_handler = JLLToolHandler()
+
+    # ── Processors ────────────────────────────────────────────────────────────
+    func_filter        = FunctionCallFilter()
+    text_normalizer    = TextNormalizerProcessor()
+    stt_log            = STTLogProcessor()
+    conv_log           = ConversationLogProcessor()
+    tts_log            = TTSLogProcessor()
+    vad_log            = VADLogProcessor()
+    echo_gate          = EchoCancelGate()
+    tts_tracker        = TTSSpeakingTracker(gate=echo_gate)
+    phonetic_corrector = PhoneticCorrectorProcessor(context=context)
+
+    # ── Ack phrases ───────────────────────────────────────────────────────────
+    log_pipeline_event("ACK", "Pre-synthesizing acknowledgment phrases via Cartesia")
+    ack_pcms = await _prefetch_ack_phrases(
+        settings.CARTESIA_API_KEY,
+        settings.CARTESIA_VOICE_ID,
+        settings.SAMPLE_RATE,
+    )
+
+    # ── Typing sound ──────────────────────────────────────────────────────────
+    _keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
+    log.info("[SOUND] Keyboard PCM ready  %.1fs  %d bytes", 4.0, len(_keyboard_pcm))
+    typing_sound_gate = TypingSoundGate(
+        keyboard_pcm=_keyboard_pcm,
+        sample_rate=settings.SAMPLE_RATE,
+        ack_pcms=ack_pcms,
+    )
+    typing_sound = TypingSoundProcessor(
+        typing_sound_gate=typing_sound_gate,
+        echo_gate=echo_gate,
+    )
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    # VAD is placed before echo_gate so interruption detection works even
+    # while bot is speaking. Echo_gate drops audio frames (not VAD events),
+    # so STT won't transcribe echo but the pipeline still sees speech start.
+    pipeline = Pipeline(
+        [
+            transport.input(),               # 1.  WebSocket audio in
+            vad,                             # 2.  Silero VAD (explicit — no built-in for WS)
+            echo_gate,                       # 3.  Drop mic frames while bot speaks
+            vad_log,                         # 4.  Reset latency clock on VAD speech start
+            stt,                             # 5.  Azure STT → TranscriptionFrame
+            stt_log,                         # 6.  STT log + stt_latency stamp
+            typing_sound,                    # 7.  Typing sound trigger on VAD stop
+            phonetic_corrector,              # 8.  Phonetic correction for names + locations
+            context_aggregator.user(),       # 9.  Accumulate user turn
+            llm,                             # 10. Azure OpenAI LLM
+            func_filter,                     # 11. Drop function-call markup
+            conv_log,                        # 12. LLM log
+            text_normalizer,                 # 13. Number normalisation
+            tts,                             # 14. Cartesia TTS
+            tts_log,                         # 15. TTS first chunk stamp
+            typing_sound_gate,               # 16. Keyboard PCM → seamless handoff to real TTS
+            transport.output(),              # 17. WebSocket audio out (ExotelSerializer paces chunks)
+            tts_tracker,                     # 18. Echo gate control + latency report
+            context_aggregator.assistant(),  # 19. Store assistant turn
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True),
+    )
+
+    # ── Tool handlers ─────────────────────────────────────────────────────────
+    _TOOL_FILLERS = {
+        "search_properties": "Sure! Let me search for the best options matching your requirements.",
+        "get_property_details": "Let me pull up those details for you.",
+        "areas_by_budget": "Let me check which areas fit your budget.",
+        "submit_callback": "Submitting your callback request now.",
+        "schedule_site_visit": "Scheduling your site visit now, one moment please.",
+    }
+
+    def _make_tool_handler(tool_name: str):
+        async def _handler(params) -> None:
+            args = params.arguments
+            _update_gather_hint(context, tool_handler)
+            filler = _TOOL_FILLERS.get(tool_name, "One moment please.")
+            await task.queue_frame(TTSSpeakFrame(text=filler))
+            t0 = __import__("time").monotonic()
+            result_text = await tool_handler.handle(tool_name, args)
+            elapsed = __import__("time").monotonic() - t0
+            log.info(
+                "[TOOL] %-22s | %s | %.2fs",
+                tool_name,
+                json.dumps({k: v for k, v in args.items() if k in ("city", "location", "property_type", "min_price", "max_price")}, ensure_ascii=False),
+                elapsed,
+            )
+            log.info("[TOOL-RESULT] %s", result_text[:120])
+            await params.result_callback(result_text)
+        return _handler
+
+    for schema in TOOL_SCHEMAS:
+        func_name: str = schema["function"]["name"]
+        llm.register_function(func_name, _make_tool_handler(func_name))
+
+    # ── Opening greeting ──────────────────────────────────────────────────────
+    @task.event_handler("on_pipeline_started")
+    async def _trigger_opening(t: PipelineTask, _frame: StartFrame) -> None:
+        log_pipeline_event("GREET", "Triggering opening from system_prompt.txt")
+        from pipecat.frames.frames import LLMMessagesAppendFrame
+        await t.queue_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": "[BEGIN]"}],
+                run_llm=True,
+            )
+        )
+
+    # ── Runner ────────────────────────────────────────────────────────────────
+    log_pipeline_event("READY", "WebSocket pipeline assembled — waiting for audio")
+    log.info("[bold green]✅ JLL Agent (WS) ready.[/bold green] stream_sid=%s", stream_sid)
+
+    runner = PipelineRunner()
+    try:
+        await runner.run(task)
+    except Exception as exc:
+        log.warning("[WS] Pipeline ended: %s", exc)
+    finally:
+        log_pipeline_event("CLEANUP", "WebSocket session ended")
+        await task.cancel()
+        log.info("[WS] Agent session closed. stream_sid=%s", stream_sid)
 
 
 def _update_gather_hint(context: LLMContext, tool_handler: JLLToolHandler) -> None:
