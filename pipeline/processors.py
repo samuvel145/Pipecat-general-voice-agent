@@ -140,13 +140,18 @@ class TypingSoundProcessor(FrameProcessor):
     """
     Thin signal router at pipeline position 6 (after STT).
 
-    On TranscriptionFrame:
-      1. Pre-closes EchoCancelGate so the mic is muted before the first
-         audio chunk plays — prevents ack phrase speech from being picked
-         up by the mic and re-transcribed.
+    On VADUserStoppedSpeakingFrame:
+      1. Pre-closes EchoCancelGate immediately — no echo window even at high
+         STT latency, because we act on VAD stop, not on TranscriptionFrame.
       2. Calls typing_sound_gate.start_kb() to begin ack phrase + keyboard.
+         This masks the full STT + LLM + TTS gap on both local and remote servers.
 
-    On user-started-speaking: cancels the keyboard immediately.
+    On user-started-speaking: cancels the keyboard. If audio had not yet started
+    playing (task cancelled before first frame), re-opens the echo gate directly
+    because TTSSpeakingTracker will never see a BotStartedSpeakingFrame.
+
+    On empty TranscriptionFrame: STT returned nothing useful (background noise)
+    so the typing sound is cancelled and the gate is re-opened.
     """
 
     def __init__(
@@ -161,12 +166,21 @@ class TypingSoundProcessor(FrameProcessor):
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            # Mute mic before first audio chunk plays — no echo window
+        if isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
+            # User stopped talking — start immediately, mask full STT+LLM+TTS gap
             self._echo_gate.set_bot_speaking(True)
             self._typing_gate.start_kb()
         elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            audio_was_started = self._typing_gate.audio_started
             self._typing_gate.stop_kb("user speaking again")
+            if not audio_was_started:
+                # Task cancelled before first audio frame pushed — BotStartedSpeakingFrame
+                # never fired, so TTSSpeakingTracker won't reopen the gate. Do it here.
+                self._echo_gate.set_bot_speaking(False)
+        elif isinstance(frame, TranscriptionFrame) and not frame.text.strip():
+            # STT returned empty (background noise false alarm) — cancel and reopen
+            self._typing_gate.stop_kb("empty transcription")
+            self._echo_gate.set_bot_speaking(False)
         await self.push_frame(frame, direction)
 
 
@@ -179,7 +193,7 @@ class TypingSoundGate(FrameProcessor):
     audio never travels upstream through STT or any other processor.
 
     Seamless handoff:
-      start_kb()         — called by TypingSoundProcessor on TranscriptionFrame
+      start_kb()         — called by TypingSoundProcessor on VADUserStoppedSpeakingFrame
       stop_kb()          — called on first real TTSAudioRawFrame from Cartesia
                            (the keyboard's last chunk finishes, then TTS takes
                            over with zero silence gap)
@@ -200,6 +214,7 @@ class TypingSoundGate(FrameProcessor):
         self._tts_seen: bool = False  # True once first real TTS frame passes
         self._ack_pcms: list[bytes] = list(ack_pcms) if ack_pcms else []
         self._ack_pool: list[bytes] = []  # shuffled draw pool, refilled when empty
+        self._audio_started: bool = False  # True once first OutputAudioRawFrame is pushed
 
     def _next_ack(self) -> bytes | None:
         if not self._ack_pcms:
@@ -209,10 +224,16 @@ class TypingSoundGate(FrameProcessor):
             random.shuffle(self._ack_pool)
         return self._ack_pool.pop()
 
+    @property
+    def audio_started(self) -> bool:
+        """True once the first OutputAudioRawFrame has actually been pushed."""
+        return self._audio_started
+
     def start_kb(self) -> None:
         if self._kb_task and not self._kb_task.done():
             return
         self._tts_seen = False
+        self._audio_started = False
         _typing_log.info("[TYPING] sound START — masking STT+LLM+TTS latency")
         if self._ack_pcms:
             self._kb_task = asyncio.create_task(self._ack_then_keyboard_loop())
@@ -237,6 +258,7 @@ class TypingSoundGate(FrameProcessor):
         ack = self._next_ack()
         if ack:
             _typing_log.info("[ACK] playing acknowledgment phrase")
+            self._audio_started = True
             await self.push_frame(
                 OutputAudioRawFrame(audio=ack, sample_rate=self._sample_rate, num_channels=1),
                 FrameDirection.DOWNSTREAM,
@@ -250,6 +272,7 @@ class TypingSoundGate(FrameProcessor):
     async def _keyboard_loop(self) -> None:
         chunk = self._sample_rate * 2 * 20 // 1000  # 20 ms of 16-bit mono PCM
         pos, n = 0, len(self._pcm)
+        self._audio_started = True
         try:
             while True:
                 end  = pos + chunk
