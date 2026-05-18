@@ -327,7 +327,12 @@ async def run_agent() -> None:
         log.info("Agent stopped cleanly.")
 
 
-async def run_agent_ws(websocket, stream_sid: str = "") -> None:
+async def run_agent_ws(
+    websocket,
+    stream_sid: str = "",
+    ack_pcms: list[bytes] | None = None,
+    keyboard_pcm: bytes | None = None,
+) -> None:
     """WebSocket pipeline for phone/remote clients (Exotel/Vodafone protocol).
 
     Audio flows over WebSocket as base64-encoded PCM JSON frames:
@@ -351,6 +356,10 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             audio_out_channels=settings.CHANNELS,
             audio_in_passthrough=True,  # pass frames downstream for VADProcessor
             serializer=serializer,
+            # Split large ack-phrase / TTS frames into 20 ms chunks so the
+            # carrier (Exotel/Vodafone) receives properly sized payloads and
+            # the _write_audio_sleep clock stays accurate.
+            fixed_audio_packet_size=640,  # 20 ms × 16 kHz × 2 bytes = 640 bytes
         ),
     )
 
@@ -420,19 +429,26 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
 
-    # ── Ack phrases ───────────────────────────────────────────────────────────
-    log_pipeline_event("ACK", "Pre-synthesizing acknowledgment phrases via Cartesia")
-    ack_pcms = await _prefetch_ack_phrases(
-        settings.CARTESIA_API_KEY,
-        settings.CARTESIA_VOICE_ID,
-        settings.SAMPLE_RATE,
-    )
+    # ── Ack phrases (use pre-warmed pool from lifespan; fall back per-call) ──────
+    if ack_pcms is None:
+        log_pipeline_event("ACK", "Pre-synthesizing acknowledgment phrases (per-call fallback)")
+        ack_pcms = await _prefetch_ack_phrases(
+            settings.CARTESIA_API_KEY,
+            settings.CARTESIA_VOICE_ID,
+            settings.SAMPLE_RATE,
+        )
+    else:
+        log.info("[ACK] Using %d pre-warmed phrases from startup", len(ack_pcms))
 
-    # ── Typing sound ──────────────────────────────────────────────────────────
-    _keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
-    log.info("[SOUND] Keyboard PCM ready  %.1fs  %d bytes", 4.0, len(_keyboard_pcm))
+    # ── Typing sound (use pre-warmed PCM from lifespan; fall back per-call) ──────
+    if keyboard_pcm is None:
+        keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
+        log.info("[SOUND] Keyboard PCM generated on-demand  %d bytes", len(keyboard_pcm))
+    else:
+        log.info("[SOUND] Using pre-warmed keyboard PCM  %d bytes", len(keyboard_pcm))
+
     typing_sound_gate = TypingSoundGate(
-        keyboard_pcm=_keyboard_pcm,
+        keyboard_pcm=keyboard_pcm,
         sample_rate=settings.SAMPLE_RATE,
         ack_pcms=ack_pcms,
     )

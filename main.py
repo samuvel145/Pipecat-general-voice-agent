@@ -25,8 +25,9 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 
 from logger import get_logger, setup_logging
+from config import settings
 from pipeline import jll_client
-from pipeline.agent import run_agent, run_agent_ws
+from pipeline.agent import run_agent, run_agent_ws, _prefetch_ack_phrases, _gen_keyboard_pcm
 
 log = get_logger("agent")
 
@@ -42,8 +43,41 @@ _proxy_proc: subprocess.Popen | None = None
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # ── Startup: pre-warm expensive per-call resources once ───────────────────
+    # Pre-warm Silero VAD — loads PyTorch model into process memory so the first
+    # call does not pay the ~300 ms cold-start penalty.
+    try:
+        from pipecat.audio.vad.silero import SileroVADAnalyzer
+        log.info("[Startup] Pre-warming Silero VAD model…")
+        _warmup_vad = await asyncio.to_thread(SileroVADAnalyzer)
+        del _warmup_vad   # model is now in OS page cache; each call creates its own instance
+        log.info("[Startup] Silero VAD model warm.")
+    except Exception as exc:
+        log.warning("[Startup] Silero warm-up skipped: %s", exc)
+
+    # Pre-generate keyboard typing PCM (deterministic, ~4 s, CPU-only).
+    log.info("[Startup] Pre-generating keyboard PCM…")
+    _app.state.keyboard_pcm = _gen_keyboard_pcm(settings.SAMPLE_RATE)
+    log.info("[Startup] Keyboard PCM ready  %d bytes", len(_app.state.keyboard_pcm))
+
+    # Pre-synthesize ack phrases via Cartesia REST once at startup so every
+    # WebSocket call can start the typing sound immediately without waiting for
+    # 10 HTTP round-trips.
+    log.info("[Startup] Pre-fetching acknowledgment phrases…")
+    try:
+        _app.state.ack_pcms = await _prefetch_ack_phrases(
+            settings.CARTESIA_API_KEY,
+            settings.CARTESIA_VOICE_ID,
+            settings.SAMPLE_RATE,
+        )
+        log.info("[Startup] %d ack phrases ready.", len(_app.state.ack_pcms))
+    except Exception as exc:
+        log.warning("[Startup] Ack phrase prefetch failed (non-fatal): %s", exc)
+        _app.state.ack_pcms = []
+
     yield
-    # Shutdown: close shared HTTP client and stop Node proxy.
+
+    # ── Shutdown: close shared HTTP client and stop Node proxy ────────────────
     await jll_client.close_client()
     if _proxy_proc and _proxy_proc.poll() is None:
         print("[Proxy] Stopping Node proxy …", flush=True)
@@ -79,7 +113,9 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         pass
 
-    await run_agent_ws(websocket, stream_sid)
+    ack_pcms     = getattr(app.state, "ack_pcms", None)
+    keyboard_pcm = getattr(app.state, "keyboard_pcm", None)
+    await run_agent_ws(websocket, stream_sid, ack_pcms=ack_pcms, keyboard_pcm=keyboard_pcm)
 
 
 @app.get("/health")

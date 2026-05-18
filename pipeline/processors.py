@@ -286,7 +286,7 @@ class TypingSoundGate(FrameProcessor):
                     OutputAudioRawFrame(audio=data, sample_rate=self._sample_rate, num_channels=1),
                     FrameDirection.DOWNSTREAM,
                 )
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             pass
 
