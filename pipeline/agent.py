@@ -25,7 +25,7 @@ import struct
 from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import StartFrame, TTSSpeakFrame
+from pipecat.frames.frames import StartFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -147,8 +147,8 @@ async def run_agent() -> None:
     stt = AzureSTTService(
         api_key=settings.AZURE_STT_KEY,
         region=settings.AZURE_SPEECH_REGION,
-        language=Language.EN_IN,
         sample_rate=settings.SAMPLE_RATE,
+        settings=AzureSTTService.Settings(language=Language.EN_IN),
     )
 
     # ── LLM — Azure OpenAI (gpt-4o-mini) ────────────────────────────────
@@ -156,8 +156,8 @@ async def run_agent() -> None:
     llm = AzureLLMService(
         api_key=settings.AZURE_OPENAI_API_KEY,
         endpoint=settings.AZURE_OPENAI_ENDPOINT,
-        model=settings.AZURE_OPENAI_DEPLOYMENT,
         settings=AzureLLMService.Settings(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
         ),
@@ -256,28 +256,12 @@ async def run_agent() -> None:
     )
 
     # ── Tool call handlers ────────────────────────────────────────────────────
-    # Pipecat 1.1.0 uses llm.register_function() — one call per tool.
-    # The callback receives a FunctionCallParams object with .arguments (dict),
-    # .result_callback (async callable), and other metadata.
-    # Per-tool filler phrases — spoken immediately so user isn't left in silence
-    _TOOL_FILLERS = {
-        "search_properties": "Sure! Let me search for the best options matching your requirements.",
-        "get_property_details": "Let me pull up those details for you.",
-        "areas_by_budget": "Let me check which areas fit your budget.",
-        "submit_callback": "Submitting your callback request now.",
-        "schedule_site_visit": "Scheduling your site visit now, one moment please.",
-    }
-
+    # The LLM is instructed (system prompt SEARCH ANNOUNCEMENT) to speak a brief
+    # status phrase before every tool call — no separate TTSSpeakFrame filler needed.
     def _make_tool_handler(tool_name: str):
         async def _handler(params) -> None:
             args = params.arguments
             _update_gather_hint(context, tool_handler)
-
-            # Speak filler IMMEDIATELY so user hears something during API fetch
-            filler = _TOOL_FILLERS.get(tool_name, "One moment please.")
-            await task.queue_frame(TTSSpeakFrame(text=filler))
-
-            # Fetch from backend; log call + result concisely
             t0 = __import__("time").monotonic()
             result_text = await tool_handler.handle(tool_name, args)
             elapsed = __import__("time").monotonic() - t0
@@ -380,16 +364,16 @@ async def run_agent_ws(
     stt = AzureSTTService(
         api_key=settings.AZURE_STT_KEY,
         region=settings.AZURE_SPEECH_REGION,
-        language=Language.EN_IN,
         sample_rate=settings.SAMPLE_RATE,
+        settings=AzureSTTService.Settings(language=Language.EN_IN),
     )
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     llm = AzureLLMService(
         api_key=settings.AZURE_OPENAI_API_KEY,
         endpoint=settings.AZURE_OPENAI_ENDPOINT,
-        model=settings.AZURE_OPENAI_DEPLOYMENT,
         settings=AzureLLMService.Settings(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
         ),
@@ -491,20 +475,10 @@ async def run_agent_ws(
     )
 
     # ── Tool handlers ─────────────────────────────────────────────────────────
-    _TOOL_FILLERS = {
-        "search_properties": "Sure! Let me search for the best options matching your requirements.",
-        "get_property_details": "Let me pull up those details for you.",
-        "areas_by_budget": "Let me check which areas fit your budget.",
-        "submit_callback": "Submitting your callback request now.",
-        "schedule_site_visit": "Scheduling your site visit now, one moment please.",
-    }
-
     def _make_tool_handler(tool_name: str):
         async def _handler(params) -> None:
             args = params.arguments
             _update_gather_hint(context, tool_handler)
-            filler = _TOOL_FILLERS.get(tool_name, "One moment please.")
-            await task.queue_frame(TTSSpeakFrame(text=filler))
             t0 = __import__("time").monotonic()
             result_text = await tool_handler.handle(tool_name, args)
             elapsed = __import__("time").monotonic() - t0

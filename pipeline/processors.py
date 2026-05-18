@@ -135,23 +135,54 @@ class TTSSpeakingTracker(FrameProcessor):
 
 _typing_log = get_logger("typing_sound")
 
+# Phrases where playing an ack phrase is inappropriate (farewells, plain closings).
+# Normalized to lowercase with punctuation stripped before matching.
+_CLOSING_PHRASES: frozenset[str] = frozenset({
+    # Farewells
+    "bye", "goodbye", "good bye", "see you", "see you later", "take care",
+    "bye bye", "ok bye", "okay bye", "thanks bye", "thank you bye",
+    # Pure thanks (end of call)
+    "thank you", "thanks", "thank you so much", "thanks a lot", "many thanks",
+    "okay thank you", "ok thank you", "okay thanks", "ok thanks",
+    "thank you very much", "thanks very much",
+    # Call-back deferrals
+    "i will call you later", "will call you later", "call you later",
+    "i will call back", "will call back", "i ll call back",
+    "i will get back to you", "will get back to you",
+    "i ll get back", "i will get back",
+    # That's all
+    "that is all", "that's all", "nothing else", "nothing more", "nothing right now",
+    "no thanks", "no thank you", "not right now",
+})
+
+
+def _is_closing_phrase(text: str) -> bool:
+    """Return True when the transcript is a farewell/closing that needs no ack phrase."""
+    normalized = re.sub(r"[.!?,]", "", text.lower()).strip()
+    return normalized in _CLOSING_PHRASES
+
 
 class TypingSoundProcessor(FrameProcessor):
     """
-    Thin signal router at pipeline position 6 (after STT).
+    Thin signal router placed after STT in the pipeline.
 
-    On VADUserStoppedSpeakingFrame:
-      1. Pre-closes EchoCancelGate immediately — no echo window even at high
-         STT latency, because we act on VAD stop, not on TranscriptionFrame.
-      2. Calls typing_sound_gate.start_kb() to begin ack phrase + keyboard.
-         This masks the full STT + LLM + TTS gap on both local and remote servers.
+    Trigger order (whichever arrives first wins):
+      TranscriptionFrame (non-empty, non-closing)
+        → start ack phrase + keyboard immediately — faster than Silero silence
+          detection, which typically fires 600 ms–1 s after Azure STT returns.
+      VADUserStoppedSpeakingFrame
+        → fallback trigger if STT has not yet returned (WS/server mode where
+          Silero fires before Azure STT).  No-op if ack already started.
 
-    On user-started-speaking: cancels the keyboard. If audio had not yet started
-    playing (task cancelled before first frame), re-opens the echo gate directly
-    because TTSSpeakingTracker will never see a BotStartedSpeakingFrame.
-
-    On empty TranscriptionFrame: STT returned nothing useful (background noise)
-    so the typing sound is cancelled and the gate is re-opened.
+    Special cases:
+      Closing phrase ("Thank you", "Bye", …)
+        → cancel ack, reopen echo gate, let LLM reply naturally.
+      Ghost STT (TranscriptionFrame arrives >5 s after last VAD start)
+        → Azure STT buffered audio from bot speech; ignore silently.
+      Empty TranscriptionFrame
+        → background noise false-alarm; cancel and reopen.
+      VADUserStartedSpeakingFrame
+        → user interrupted; cancel keyboard, reopen gate if no audio pushed yet.
     """
 
     def __init__(
@@ -163,24 +194,64 @@ class TypingSoundProcessor(FrameProcessor):
         super().__init__(**kwargs)
         self._typing_gate = typing_sound_gate
         self._echo_gate = echo_gate
+        # Set by TranscriptionFrame handler to prevent VADUserStoppedSpeakingFrame
+        # from (re-)starting the ack phrase when we've already decided to skip it.
+        self._skip_next_kb: bool = False
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
-            # User stopped talking — start immediately, mask full STT+LLM+TTS gap
-            self._echo_gate.set_bot_speaking(True)
-            self._typing_gate.start_kb()
+            if self._skip_next_kb:
+                # TranscriptionFrame already decided to skip (closing / ghost / empty)
+                self._skip_next_kb = False
+            else:
+                # Fallback: STT hasn't fired yet — start ack now
+                self._echo_gate.set_bot_speaking(True)
+                self._typing_gate.start_kb()
+
         elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            self._skip_next_kb = False
             audio_was_started = self._typing_gate.audio_started
             self._typing_gate.stop_kb("user speaking again")
             if not audio_was_started:
-                # Task cancelled before first audio frame pushed — BotStartedSpeakingFrame
-                # never fired, so TTSSpeakingTracker won't reopen the gate. Do it here.
+                # Ack task cancelled before pushing audio — BotStartedSpeakingFrame
+                # never fired, so TTSSpeakingTracker won't reopen the gate.
                 self._echo_gate.set_bot_speaking(False)
-        elif isinstance(frame, TranscriptionFrame) and not frame.text.strip():
-            # STT returned empty (background noise false alarm) — cancel and reopen
-            self._typing_gate.stop_kb("empty transcription")
-            self._echo_gate.set_bot_speaking(False)
+
+        elif isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+
+            # Ghost: TranscriptionFrame arrived long after the last VAD start — Azure
+            # STT is finalising buffered audio from during bot speech.
+            is_ghost = (
+                _TurnLatency.vad_start == 0.0
+                or (time.monotonic() - _TurnLatency.vad_start) > 5.0
+            )
+
+            if not text:
+                # Empty = background noise; cancel and reopen
+                self._skip_next_kb = True
+                self._typing_gate.stop_kb("empty transcription")
+                self._echo_gate.set_bot_speaking(False)
+
+            elif is_ghost:
+                age = (time.monotonic() - _TurnLatency.vad_start) if _TurnLatency.vad_start else 0
+                _typing_log.warning("[TYPING] Ghost STT ignored  age=%.1fs  text=%r", age, text)
+                self._skip_next_kb = True
+
+            elif _is_closing_phrase(text):
+                # Closing / farewell — cancel ack, let agent reply normally
+                _typing_log.info("[TYPING] Closing phrase — skipping ack: %r", text)
+                self._skip_next_kb = True
+                self._typing_gate.stop_kb("closing phrase")
+                self._echo_gate.set_bot_speaking(False)
+
+            else:
+                # Real turn — start ack immediately (faster than Silero silence)
+                self._echo_gate.set_bot_speaking(True)
+                self._typing_gate.start_kb()
+
         await self.push_frame(frame, direction)
 
 
@@ -458,6 +529,16 @@ class TextNormalizerProcessor(FrameProcessor):
         return str(n)
 
     def _normalise(self, text: str) -> str:
+        # Strip markdown formatting (LLM sometimes ignores the no-markdown instruction)
+        text = re.sub(r"\*{1,2}([^*\n]+)\*{1,2}", r"\1", text)   # **bold** / *italic*
+        text = re.sub(r"#{1,6}\s*", "", text)                      # ## heading markers
+        text = re.sub(r"\n+", " ", text)                           # newlines → space
+        text = re.sub(r"(?:^| )\d+\.\s+", " ", text).strip()     # "1. item" list markers
+        # Remove non-decimal periods — prevents Cartesia reading "dot" and letter-spelling
+        # e.g. "T.Nagar" → "T Nagar", "N.a.g.a.r." → "N a g a r" (then assembled naturally)
+        text = re.sub(r"(?<!\d)\.(?!\d)", " ", text)
+        text = re.sub(r" +", " ", text).strip()
+        # Currency and number normalisation
         def _repl_currency(m: re.Match) -> str:
             return self._to_words(m.group(1) or m.group(2))
         text = self._CURRENCY_RE.sub(_repl_currency, text)
@@ -477,8 +558,11 @@ class TextNormalizerProcessor(FrameProcessor):
 
         if isinstance(frame, LLMTextFrame) and frame.text:
             self._buf += frame.text
-            # Flush on sentence boundary so Cartesia still starts early
-            if self._SENTENCE_END_RE.search(frame.text):
+            # Flush on sentence boundary so Cartesia still starts early.
+            # Guard: buffer must have a space (≥2 words) — prevents flushing a single
+            # letter like "T" when the next token is "." (would cause letter-spelling).
+            # Normal sentences always have spaces, so latency is unaffected.
+            if self._SENTENCE_END_RE.search(frame.text) and ' ' in self._buf:
                 await self._flush(direction)
             return
 
